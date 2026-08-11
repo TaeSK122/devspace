@@ -2,6 +2,11 @@ import { accessSync, constants } from "node:fs";
 import { delimiter, resolve } from "node:path";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import {
+  codexCommandEnvironment,
+  isCodexAppServerSupported,
+  resolveCodexCommand,
+} from "./local-agent-codex.js";
+import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
@@ -24,7 +29,7 @@ export function checkLocalAgentProviderAvailability(
 ): LocalAgentProviderAvailability {
   switch (provider) {
     case "codex":
-      return packageAvailability(provider, "@openai/codex-sdk");
+      return codexAvailability(env);
     case "claude":
       return packageAvailability(provider, "@anthropic-ai/claude-agent-sdk");
     case "opencode":
@@ -80,6 +85,17 @@ function packageAvailability(
       reason: `${packageName} package not found`,
     };
   }
+}
+
+function codexAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const command = resolveCodexCommand(env);
+  if (!command) {
+    return { name: "codex", available: false, reason: "codex executable not found" };
+  }
+  if (!isCodexAppServerSupported(command.executable, codexCommandEnvironment(env))) {
+    return { name: "codex", available: false, reason: "codex app-server is not supported" };
+  }
+  return { name: "codex", available: true };
 }
 
 function commandAvailability(

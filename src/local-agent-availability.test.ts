@@ -5,7 +5,20 @@ import {
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
 
-assert.equal(checkLocalAgentProviderAvailability("codex").available, true);
+{
+  const availability = checkLocalAgentProviderAvailability("codex");
+  assert.equal(availability.name, "codex");
+  assert.equal(typeof availability.available, "boolean");
+}
+
+{
+  const availability = checkLocalAgentProviderAvailability("codex", {
+    ...process.env,
+    CODEX_COMMAND: "/definitely/missing/devspace-codex",
+  });
+  assert.equal(availability.available, false);
+  assert.match(availability.reason ?? "", /executable not found/);
+}
 
 {
   const availability = checkLocalAgentProviderAvailability("pi", {

@@ -17,6 +17,7 @@ import {
   type LocalAgentDriver,
 } from "./local-agent-runtime.js";
 import { LOCAL_AGENT_PROVIDERS } from "./local-agent-profiles.js";
+import { CodexLocalAgentDriver } from "./local-agent-codex.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -53,7 +54,8 @@ export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgen
 }
 
 export function createLocalAgentDrivers(): LocalAgentDriver[] {
-  return LOCAL_AGENT_PROVIDERS.map((provider) => new LegacyLocalAgentDriver(provider));
+  return LOCAL_AGENT_PROVIDERS.map((provider) =>
+    provider === "codex" ? new CodexLocalAgentDriver() : new LegacyLocalAgentDriver(provider));
 }
 
 class LegacyLocalAgentDriver implements LocalAgentDriver {
