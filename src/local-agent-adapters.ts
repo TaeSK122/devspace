@@ -20,6 +20,7 @@ import { LOCAL_AGENT_PROVIDERS } from "./local-agent-profiles.js";
 import { AcpLocalAgentDriver } from "./local-agent-acp.js";
 import { CodexLocalAgentDriver } from "./local-agent-codex.js";
 import { OpencodeLocalAgentDriver } from "./local-agent-opencode.js";
+import { PiLocalAgentDriver } from "./local-agent-pi.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -63,7 +64,9 @@ export function createLocalAgentDrivers(): LocalAgentDriver[] {
         ? new OpencodeLocalAgentDriver()
         : provider === "cursor" || provider === "copilot"
           ? new AcpLocalAgentDriver(provider)
-        : new LegacyLocalAgentDriver(provider));
+          : provider === "pi"
+            ? new PiLocalAgentDriver()
+          : new LegacyLocalAgentDriver(provider));
 }
 
 class LegacyLocalAgentDriver implements LocalAgentDriver {
