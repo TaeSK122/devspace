@@ -1,0 +1,234 @@
+import { join } from "node:path";
+import type {
+  LocalAgentDriver,
+  LocalAgentRunInput,
+  LocalAgentRunResult,
+  LocalAgentRuntime,
+  LocalAgentRuntimeContext,
+} from "./local-agent-runtime.js";
+
+export interface PiSessionLike {
+  readonly sessionId: string;
+  readonly state: { messages: unknown[] };
+  readonly modelRegistry?: { find(provider: string, modelId: string): unknown };
+  prompt(text: string): Promise<void>;
+  subscribe(listener: (event: unknown) => void): () => void;
+  setModel?(model: unknown): Promise<void>;
+  setThinkingLevel?(level: unknown): void;
+  dispose(): void;
+}
+
+export type PiSessionFactory = (
+  context: LocalAgentRuntimeContext,
+  input: LocalAgentRunInput,
+) => Promise<PiSessionLike>;
+
+export class PiSessionRuntime implements LocalAgentRuntime {
+  readonly provider = "pi" as const;
+  private readonly unsubscribe: () => void;
+  private alive = true;
+  private closed = false;
+  private collectingEvents = false;
+  private events: unknown[] = [];
+
+  constructor(
+    private readonly session: PiSessionLike,
+  ) {
+    this.unsubscribe = session.subscribe((event) => {
+      if (this.collectingEvents) this.events.push(event);
+    });
+  }
+
+  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    if (!this.isAlive()) throw new Error("Pi runtime is not running.");
+    await this.applyOverrides(input);
+    this.events = [];
+    const messageStart = this.session.state.messages.length;
+    this.collectingEvents = true;
+    try {
+      await this.session.prompt(input.prompt);
+    } finally {
+      this.collectingEvents = false;
+    }
+    const currentMessages = this.session.state.messages.slice(messageStart);
+    const finalResponse = extractPiFinalResponse({ messages: currentMessages });
+    if (!finalResponse) {
+      const providerError = extractPiProviderError(this.events) || extractPiProviderError(currentMessages);
+      throw new Error(providerError ? `Pi returned an error: ${providerError}` : "Pi did not return a final assistant response.");
+    }
+    return {
+      provider: this.provider,
+      providerSessionId: this.session.sessionId,
+      finalResponse,
+      items: [...this.events, ...currentMessages],
+    };
+  }
+
+  async releaseSession(_providerSessionId: string): Promise<void> {
+    // The runtime is already scoped to one logical Pi session.
+  }
+
+  isAlive(): boolean {
+    return this.alive && !this.closed;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.alive = false;
+    this.unsubscribe();
+    this.session.dispose();
+  }
+
+  private async applyOverrides(input: LocalAgentRunInput): Promise<void> {
+    if (input.model && this.session.modelRegistry && this.session.setModel) {
+      const model = resolvePiModel(this.session.modelRegistry, input.model);
+      if (!model) throw new Error(`Pi model not found: ${input.model}`);
+      await this.session.setModel(model);
+    }
+    if (input.thinking && this.session.setThinkingLevel) {
+      this.session.setThinkingLevel(input.thinking);
+    }
+  }
+}
+
+export class PiLocalAgentDriver implements LocalAgentDriver {
+  readonly provider = "pi" as const;
+  readonly idleTimeoutMs = 3 * 60_000;
+
+  constructor(private readonly factory: PiSessionFactory = defaultPiSessionFactory) {}
+
+  runtimeKey(context: LocalAgentRuntimeContext): string {
+    return `pi:${context.agentId}`;
+  }
+
+  async createRuntime(context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
+    const input: LocalAgentRunInput = {
+      prompt: "",
+      workspace: context.workspace,
+      providerSessionId: context.providerSessionId,
+      writeMode: context.writeMode,
+      model: context.model,
+      thinking: context.thinking,
+    };
+    const session = await this.factory(context, input);
+    return new PiSessionRuntime(session);
+  }
+}
+
+async function defaultPiSessionFactory(
+  context: LocalAgentRuntimeContext,
+  input: LocalAgentRunInput,
+): Promise<PiSessionLike> {
+  const {
+    AuthStorage,
+    ModelRegistry,
+    SessionManager,
+    createAgentSession,
+    getAgentDir,
+  } = await import("@earendil-works/pi-coding-agent");
+  // DevSpace's agentDir is the compatibility directory used for instructions;
+  // Pi keeps its own native auth, model, and session state under getAgentDir().
+  const agentDir = getAgentDir();
+  const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+  const modelRegistry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
+  const sessionManager = await resolveSessionManager(SessionManager, input.workspace, input.providerSessionId);
+  const model = input.model ? resolvePiModel(modelRegistry, input.model) : undefined;
+  if (input.model && !model) throw new Error(`Pi model not found: ${input.model}`);
+  const tools = input.writeMode === "read_only"
+    ? ["read", "grep", "find", "ls"]
+    : undefined;
+  const result = await createAgentSession({
+    cwd: input.workspace,
+    agentDir,
+    authStorage,
+    modelRegistry,
+    sessionManager: sessionManager as never,
+    ...(model ? { model: model as never } : {}),
+    ...(input.thinking ? { thinkingLevel: input.thinking as never } : {}),
+    ...(tools ? { tools } : {}),
+  });
+  return result.session as unknown as PiSessionLike;
+}
+
+interface PiSessionManagerApi {
+  create(cwd: string): unknown;
+  open(path: string): unknown;
+  list(cwd: string): Promise<Array<{ id: string; path: string }>>;
+}
+
+async function resolveSessionManager(
+  SessionManager: PiSessionManagerApi,
+  workspace: string,
+  providerSessionId: string | undefined,
+): Promise<unknown> {
+  if (!providerSessionId) return SessionManager.create(workspace);
+  const sessions = await SessionManager.list(workspace);
+  const match = sessions.find((session) => session.id === providerSessionId);
+  if (!match) throw new Error(`Pi session not found: ${providerSessionId}`);
+  return SessionManager.open(match.path);
+}
+
+function resolvePiModel(registry: { find(provider: string, modelId: string): unknown; getAll?: () => unknown[] }, reference: string): unknown {
+  const separator = reference.indexOf("/");
+  if (separator !== -1) {
+    return registry.find(reference.slice(0, separator), reference.slice(separator + 1));
+  }
+  const all = registry.getAll?.() ?? [];
+  return all.find((model) => asRecord(model)?.id === reference);
+}
+
+export function extractPiFinalResponse(value: unknown): string {
+  const root = unwrapProviderPayload(value);
+  const messages = Array.isArray(root) ? root : readArray(root, "messages");
+  if (!messages) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = asRecord(messages[index]);
+    if (!message || message.role !== "assistant") continue;
+    const content = message.content;
+    if (!Array.isArray(content)) continue;
+    const text = content
+      .map((part) => {
+        const record = asRecord(part);
+        return record?.type === "text" && typeof record.text === "string" ? record.text : "";
+      })
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+export function extractPiProviderError(value: unknown): string {
+  const root = unwrapProviderPayload(value);
+  if (Array.isArray(root)) {
+    for (let index = root.length - 1; index >= 0; index -= 1) {
+      const error = extractPiProviderError(root[index]);
+      if (error) return error;
+    }
+    return "";
+  }
+  const messages = readArray(root, "messages");
+  if (messages) return extractPiProviderError(messages);
+  const record = asRecord(asRecord(root)?.message ?? root);
+  if (!record) return "";
+  const error = record.errorMessage ?? record.error;
+  return typeof error === "string" ? error.trim() : "";
+}
+
+function unwrapProviderPayload(value: unknown): unknown {
+  const record = asRecord(value);
+  return record ? record.data ?? record.result ?? value : value;
+}
+
+function readArray(value: unknown, key: string): unknown[] | undefined {
+  const result = asRecord(value)?.[key];
+  return Array.isArray(result) ? result : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
