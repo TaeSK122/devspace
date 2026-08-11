@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { delimiter, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
+import { terminateProcessTree } from "./process-platform.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunInput,
@@ -107,7 +108,13 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.closed = true;
     this.alive = false;
     this.connection.close(new Error(`${this.provider} ACP runtime closed.`));
-    if (this.child && !this.child.killed && this.child.exitCode === null) this.child.kill();
+    if (this.child && this.child.exitCode === null) {
+      const detached = process.platform !== "win32";
+      terminateProcessTree(this.child, "SIGTERM", detached);
+      if (!await waitForProcessExit(this.child, 1_000)) {
+        terminateProcessTree(this.child, "SIGKILL", detached);
+      }
+    }
   }
 
   private async openSession(input: LocalAgentRunInput): Promise<string> {
@@ -175,6 +182,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       cwd: process.cwd(),
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
       windowsHide: true,
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
@@ -223,10 +231,35 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       } catch {
         // The child still needs to be terminated if the protocol failed early.
       }
-      if (!child.killed && child.exitCode === null) child.kill();
+      if (child.exitCode === null) {
+        const detached = process.platform !== "win32";
+        terminateProcessTree(child, "SIGTERM", detached);
+        if (!await waitForProcessExit(child, 1_000)) {
+          terminateProcessTree(child, "SIGKILL", detached);
+        }
+      }
       throw error;
     }
   }
+}
+
+async function waitForProcessExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (child.exitCode !== null) return true;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    timer.unref();
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once("exit", onExit);
+  });
 }
 
 export function resolveAcpCommand(
