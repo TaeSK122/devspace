@@ -1,20 +1,20 @@
 import type {
+  ModelRef,
+  OpencodeClient,
+  PromptInput,
+  SessionMessagesResponse,
+  SessionV2Info,
+} from "@opencode-ai/sdk/v2";
+import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
 
-export interface OpencodeClientLike {
-  session: {
-    create(parameters?: unknown, options?: unknown): Promise<unknown>;
-    switchModel?(parameters?: unknown, options?: unknown): Promise<unknown>;
-    prompt(parameters?: unknown, options?: unknown): Promise<unknown>;
-    wait?(parameters?: unknown, options?: unknown): Promise<unknown>;
-    messages?(parameters?: unknown, options?: unknown): Promise<unknown>;
-  };
-}
+export type OpencodeClientLike = Pick<OpencodeClient, "v2">;
 
 export interface OpencodeServerLike {
   close(): void;
@@ -27,7 +27,6 @@ export type OpencodeFactory = () => Promise<{
 
 export class OpencodeRuntime implements LocalAgentRuntime {
   readonly provider = "opencode" as const;
-  private readonly models = new Map<string, OpencodeModelRef>();
   private alive = true;
   private closed = false;
 
@@ -36,19 +35,16 @@ export class OpencodeRuntime implements LocalAgentRuntime {
     private readonly server: OpencodeServerLike,
   ) {}
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.alive) throw new Error("OpenCode runtime is not running.");
-    const model = input.model
-      ? parseOpencodeModel(input.model, input.thinking)
-      : input.thinking && input.providerSessionId
-        ? updateOpencodeModelVariant(this.models.get(input.providerSessionId), input.thinking)
-        : undefined;
-    const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, model);
-    if (model) {
-      if (input.providerSessionId && this.client.session.switchModel) {
-        await this.client.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
-      }
-      this.models.set(sessionId, model);
+    const resumed = Boolean(input.providerSessionId);
+    const initialModel = input.model ? parseOpencodeModel(input.model, input.thinking) : undefined;
+    const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, initialModel);
+    await callbacks?.onSessionId?.(sessionId);
+
+    const model = initialModel ?? (input.thinking ? await modelWithThinking(this.client, sessionId, input.thinking) : undefined);
+    if (model && (resumed || !initialModel)) {
+      await this.client.v2.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
     }
     const promptResult = await promptOpencodeSession(this.client, sessionId, input);
     await waitForOpencodeSession(this.client, sessionId);
@@ -96,35 +92,32 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
   }
 }
 
-async function defaultOpencodeFactory(): Promise<{
-  client: OpencodeClientLike;
-  server: OpencodeServerLike;
-}> {
+async function defaultOpencodeFactory(): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
   const { createOpencode } = await import("@opencode-ai/sdk/v2");
   return createOpencode();
-}
-
-interface OpencodeModelRef {
-  providerID: string;
-  modelID: string;
-  variant?: string;
 }
 
 async function createOpencodeSession(
   client: OpencodeClientLike,
   input: LocalAgentRunInput,
-  model?: OpencodeModelRef,
+  model?: ModelRef,
 ): Promise<string> {
-  const result = await client.session.create({
+  const result = await client.v2.session.create({
     location: { directory: input.workspace },
     ...(model ? { model } : {}),
   }, { throwOnError: true });
-  const id = readNestedString(result, ["id"])
-    ?? readNestedString(result, ["data", "id"])
-    ?? readNestedString(result, ["session", "id"])
-    ?? readNestedString(result, ["data", "session", "id"]);
-  if (!id) throw new Error("OpenCode did not return a session id.");
-  return id;
+  return requireSessionId(result.data.data);
+}
+
+async function modelWithThinking(
+  client: OpencodeClientLike,
+  sessionId: string,
+  thinking: string,
+): Promise<ModelRef> {
+  const result = await client.v2.session.get({ sessionID: sessionId }, { throwOnError: true });
+  const model = result.data.data.model;
+  if (!model) throw new Error("OpenCode did not return the current session model for a thinking override.");
+  return { ...model, variant: thinking };
 }
 
 async function promptOpencodeSession(
@@ -132,35 +125,36 @@ async function promptOpencodeSession(
   sessionId: string,
   input: LocalAgentRunInput,
 ): Promise<unknown> {
-  return client.session.prompt({
+  const prompt: PromptInput = { text: input.prompt };
+  return client.v2.session.prompt({
     sessionID: sessionId,
-    prompt: { text: input.prompt },
+    prompt,
   }, { throwOnError: true });
 }
 
 async function waitForOpencodeSession(client: OpencodeClientLike, sessionId: string): Promise<void> {
-  if (!client.session.wait) return;
-  await client.session.wait({ sessionID: sessionId }, { throwOnError: true });
+  await client.v2.session.wait({ sessionID: sessionId }, { throwOnError: true });
 }
 
-async function readOpencodeMessages(client: OpencodeClientLike, sessionId: string): Promise<unknown> {
-  if (!client.session.messages) return undefined;
-  return client.session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
+async function readOpencodeMessages(
+  client: OpencodeClientLike,
+  sessionId: string,
+): Promise<SessionMessagesResponse> {
+  const result = await client.v2.session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
+  return result.data;
 }
 
-function parseOpencodeModel(model: string, variant?: string): OpencodeModelRef {
+function parseOpencodeModel(model: string, variant?: string): ModelRef {
   const separator = model.indexOf("/");
   const reference = separator === -1
-    ? { providerID: "opencode", modelID: model }
-    : { providerID: model.slice(0, separator), modelID: model.slice(separator + 1) };
+    ? { providerID: "opencode", id: model }
+    : { providerID: model.slice(0, separator), id: model.slice(separator + 1) };
   return variant ? { ...reference, variant } : reference;
 }
 
-function updateOpencodeModelVariant(
-  model: OpencodeModelRef | undefined,
-  variant: string,
-): OpencodeModelRef | undefined {
-  return model ? { ...model, variant } : undefined;
+function requireSessionId(session: SessionV2Info): string {
+  if (!session.id) throw new Error("OpenCode did not return a session id.");
+  return session.id;
 }
 
 export function extractOpenCodeFinalResponse(value: unknown): string {
@@ -210,8 +204,21 @@ function stringifyStructuredMessage(value: unknown): string {
 }
 
 function unwrapProviderPayload(value: unknown): unknown {
-  const record = asRecord(value);
-  return record ? record.data ?? record.result ?? value : value;
+  let current = value;
+  for (let depth = 0; depth < 3; depth += 1) {
+    const record = asRecord(current);
+    if (!record) return current;
+    if (record.data !== undefined) {
+      current = record.data;
+      continue;
+    }
+    if (record.result !== undefined) {
+      current = record.result;
+      continue;
+    }
+    return current;
+  }
+  return current;
 }
 
 function readArray(value: unknown, key: string): unknown[] | undefined {
