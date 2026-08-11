@@ -1,0 +1,245 @@
+import { spawnSync } from "node:child_process";
+import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type {
+  LocalAgentDriver,
+  LocalAgentRunInput,
+  LocalAgentRunResult,
+  LocalAgentRuntime,
+  LocalAgentRuntimeContext,
+} from "./local-agent-runtime.js";
+
+export interface ClaudeQueryLike extends AsyncIterable<unknown> {
+  close(): void;
+  setModel?(model?: string): Promise<void>;
+}
+
+export interface ClaudeQueryFactoryInput {
+  context: LocalAgentRuntimeContext;
+  options: Record<string, unknown>;
+  prompt: AsyncIterable<ClaudeUserMessage>;
+}
+
+export type ClaudeQueryFactory = (
+  input: ClaudeQueryFactoryInput,
+) => ClaudeQueryLike | Promise<ClaudeQueryLike>;
+
+class AsyncInputQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<{
+    resolve: (result: IteratorResult<T>) => void;
+    reject: (error: Error) => void;
+  }> = [];
+  private closed = false;
+
+  push(value: T): void {
+    if (this.closed) throw new Error("Claude input stream is closed.");
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve({ done: false, value });
+    else this.values.push(value);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    while (this.waiters.length > 0) this.waiters.shift()!.resolve({ done: true, value: undefined });
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return this;
+  }
+
+  next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift();
+    if (value !== undefined) return Promise.resolve({ done: false, value });
+    if (this.closed) return Promise.resolve({ done: true, value: undefined });
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+}
+
+export class ClaudeQueryRuntime implements LocalAgentRuntime {
+  readonly provider: LocalAgentProvider = "claude";
+  private readonly iterator: AsyncIterator<unknown>;
+  private alive = true;
+  private closed = false;
+  private providerSessionId?: string;
+
+  constructor(
+    private readonly query: ClaudeQueryLike,
+    private readonly inputQueue: AsyncInputQueue<ClaudeUserMessage>,
+    context: LocalAgentRuntimeContext,
+  ) {
+    this.providerSessionId = context.providerSessionId;
+    this.iterator = query[Symbol.asyncIterator]();
+  }
+
+  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    if (!this.isAlive()) throw new Error("Claude runtime is not running.");
+    if (input.model && this.query.setModel) await this.query.setModel(input.model);
+    this.inputQueue.push({
+      type: "user",
+      message: { role: "user", content: input.prompt },
+      parent_tool_use_id: null,
+    });
+
+    const items: unknown[] = [];
+    for (;;) {
+      let next: IteratorResult<unknown>;
+      try {
+        next = await this.iterator.next();
+      } catch (error) {
+        this.alive = false;
+        throw error;
+      }
+      if (next.done) {
+        this.alive = false;
+        throw new Error("Claude query ended before returning a result.");
+      }
+      const message = next.value;
+      items.push(message);
+      const record = asRecord(message);
+      if (typeof record?.session_id === "string") this.providerSessionId = record.session_id;
+      if (record?.type !== "result") continue;
+
+      const resultError = claudeResultError(record);
+      if (resultError) throw new Error(resultError);
+      const finalResponse = typeof record.result === "string" ? record.result.trim() : "";
+      if (!finalResponse) throw new Error("Claude did not return a final assistant response.");
+      return {
+        provider: this.provider,
+        providerSessionId: this.providerSessionId ?? null,
+        finalResponse,
+        items,
+      };
+    }
+  }
+
+  async releaseSession(_providerSessionId: string): Promise<void> {
+    // Claude's streaming query owns the durable session; it remains warm.
+  }
+
+  isAlive(): boolean {
+    return this.alive && !this.closed;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.alive = false;
+    this.inputQueue.close();
+    this.query.close();
+  }
+}
+
+export class ClaudeLocalAgentDriver implements LocalAgentDriver {
+  readonly provider = "claude" as const;
+  readonly idleTimeoutMs = 3 * 60_000;
+
+  constructor(
+    private readonly factory: ClaudeQueryFactory = defaultClaudeQueryFactory,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+  ) {}
+
+  runtimeKey(context: LocalAgentRuntimeContext): string {
+    return `claude:${context.agentId}`;
+  }
+
+  async createRuntime(context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
+    const inputQueue = new AsyncInputQueue<ClaudeUserMessage>();
+    const input: LocalAgentRunInput = {
+      prompt: "",
+      workspace: context.workspace,
+      providerSessionId: context.providerSessionId,
+      model: context.model,
+      thinking: context.thinking,
+    };
+    const query = await this.factory({
+      context,
+      options: claudeQueryOptions(context, input, this.env),
+      prompt: inputQueue,
+    });
+    return new ClaudeQueryRuntime(query, inputQueue, context);
+  }
+}
+
+async function defaultClaudeQueryFactory({
+  options,
+  prompt,
+}: ClaudeQueryFactoryInput): Promise<ClaudeQueryLike> {
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  return query({
+    prompt,
+    options: options as never,
+  }) as unknown as ClaudeQueryLike;
+}
+
+export function claudeQueryOptions(
+  context: LocalAgentRuntimeContext,
+  input: LocalAgentRunInput,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, unknown> {
+  const executable = env.CLAUDE_COMMAND ?? resolveExecutable("claude", env);
+  return {
+    cwd: input.workspace,
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.thinking ? { thinking: { type: "adaptive" }, effort: input.thinking } : {}),
+    ...(context.providerSessionId ? { resume: context.providerSessionId } : {}),
+    permissionMode: "bypassPermissions",
+    allowDangerouslySkipPermissions: true,
+    env: claudeCommandEnvironment(env),
+    ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
+  };
+}
+
+export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next = { ...env };
+  for (const key of [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_AGENT_SDK_VERSION",
+  ]) {
+    delete next[key];
+  }
+  return next;
+}
+
+export function claudeResultError(record: Record<string, unknown>): string | undefined {
+  const subtype = typeof record.subtype === "string" ? record.subtype : undefined;
+  const isError = record.is_error === true || subtype?.startsWith("error");
+  if (!isError) return undefined;
+  const message =
+    directString(record.error) ??
+    directString(record.message) ??
+    directString(record.result) ??
+    subtype ??
+    "Claude returned an error result.";
+  return `Claude returned an error result: ${message}`;
+}
+
+export interface ClaudeUserMessage {
+  type: "user";
+  message: { role: "user"; content: string };
+  parent_tool_use_id: null;
+}
+
+function resolveExecutable(command: string, env: NodeJS.ProcessEnv): string | undefined {
+  const commandHasPath = command.includes("/") || command.includes("\\");
+  if (commandHasPath) return command;
+  const result = spawnSync(process.platform === "win32" ? "where.exe" : "which", [command], {
+    encoding: "utf8",
+    env,
+    windowsHide: true,
+  });
+  const executable = result.stdout?.split(/\r?\n/).find((line) => line.trim());
+  return executable?.trim() || undefined;
+}
+
+function directString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
