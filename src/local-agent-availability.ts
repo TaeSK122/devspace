@@ -1,6 +1,4 @@
-import { accessSync, constants } from "node:fs";
-import { delimiter, resolve } from "node:path";
-import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
+import { resolveAcpCommand } from "./local-agent-acp.js";
 import {
   codexCommandEnvironment,
   isCodexAppServerSupported,
@@ -35,13 +33,19 @@ export function checkLocalAgentProviderAvailability(
     case "opencode":
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
     case "pi":
-      return commandAvailability(provider, env.PI_COMMAND ?? "pi", {
-        env: piAvailabilityEnvironment(env),
-      });
-    case "cursor":
-      return commandAvailability(provider, "cursor-agent");
-    case "copilot":
-      return commandAvailability(provider, "copilot");
+      return packageAvailability(provider, "@earendil-works/pi-coding-agent");
+    case "cursor": {
+      const command = resolveAcpCommand(provider, env);
+      return command
+        ? { name: provider, available: true }
+        : { name: provider, available: false, reason: "cursor-agent executable not found" };
+    }
+    case "copilot": {
+      const command = resolveAcpCommand(provider, env);
+      return command
+        ? { name: provider, available: true }
+        : { name: provider, available: false, reason: "copilot executable not found" };
+    }
   }
 }
 
@@ -96,69 +100,4 @@ function codexAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailabili
     return { name: "codex", available: false, reason: "codex app-server is not supported" };
   }
   return { name: "codex", available: true };
-}
-
-function commandAvailability(
-  provider: LocalAgentProvider,
-  command: string,
-  options: { env?: NodeJS.ProcessEnv } = {},
-): LocalAgentProviderAvailability {
-  const executable = resolveCommand(command, options.env);
-  if (!executable) {
-    return {
-      name: provider,
-      available: false,
-      reason: `${command} executable not found`,
-    };
-  }
-
-  return { name: provider, available: true };
-}
-
-function resolveCommand(command: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const commandHasPath = command.includes("/") || command.includes("\\");
-  if (commandHasPath) return executableExists(command) ? command : undefined;
-
-  for (const candidate of candidateCommandPaths(command, env)) {
-    if (executableExists(candidate)) return candidate;
-  }
-  return undefined;
-}
-
-function candidateCommandPaths(command: string, env: NodeJS.ProcessEnv): string[] {
-  const path = env.PATH;
-  if (!path) return [];
-  const extensions = process.platform === "win32"
-    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
-      .split(";")
-      .filter(Boolean)
-    : [""];
-  const candidates: string[] = [];
-  for (const directory of path.split(delimiter)) {
-    if (!directory) continue;
-    for (const extension of extensions) {
-      candidates.push(resolve(directory, `${command}${extension}`));
-    }
-  }
-  return candidates;
-}
-
-function executableExists(command: string): boolean {
-  const mode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
-  try {
-    accessSync(command, mode);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function piAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  if (env.PI_COMMAND) return env;
-  const path = env.PATH;
-  if (!path) return env;
-  return {
-    ...env,
-    PATH: removeDevspaceNodeModulesBinFromPath(path),
-  };
 }

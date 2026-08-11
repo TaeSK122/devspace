@@ -21,24 +21,19 @@ import {
 }
 
 {
-  const availability = checkLocalAgentProviderAvailability("pi", {
-    ...process.env,
-    PI_COMMAND: "/definitely/missing/devspace-pi",
-  });
-  assert.equal(availability.available, false);
-  assert.match(availability.reason ?? "", /executable not found/);
+  assert.equal(checkLocalAgentProviderAvailability("pi").available, true);
 }
 
 {
   const snapshot = getLocalAgentProviderAvailabilitySnapshot({
     ...process.env,
-    PI_COMMAND: "/definitely/missing/devspace-pi",
+    CODEX_COMMAND: "/definitely/missing/devspace-codex",
   });
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
     ["codex", "claude", "opencode", "pi", "cursor", "copilot"],
   );
-  assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, false);
+  assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, true);
 }
 
 assert.equal(
