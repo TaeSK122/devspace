@@ -7,6 +7,7 @@ import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import { terminateProcessTree } from "./process-platform.js";
 import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
@@ -36,6 +37,7 @@ export function resolveCodexCommand(env: NodeJS.ProcessEnv = process.env): Resol
       env: probeEnv,
       windowsHide: true,
       timeout: 5_000,
+      shell: usesWindowsCommandShell(candidate),
     });
     const code = result.error && "code" in result.error ? result.error.code : undefined;
     if (code === "ENOENT") continue;
@@ -43,6 +45,20 @@ export function resolveCodexCommand(env: NodeJS.ProcessEnv = process.env): Resol
     return { executable: candidate, version: parseCodexVersion(result.stdout) };
   }
   return undefined;
+}
+
+export function isCodexAppServerSupported(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const result = spawnSync(command, ["app-server", "--help"], {
+    encoding: "utf8",
+    env: codexCommandEnvironment(env),
+    windowsHide: true,
+    timeout: 5_000,
+    shell: usesWindowsCommandShell(command),
+  });
+  return result.error === undefined && result.status === 0;
 }
 
 export function parseCodexVersion(output: string | undefined): string | undefined {
@@ -69,6 +85,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
+      shell: usesWindowsCommandShell(options.command),
     });
     this.rpc = new CodexAppServerRpc(this.child, options.version);
     this.child.once("exit", (code, signal) => {
@@ -91,7 +108,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     this.rpc.notify("initialized");
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.alive) throw new Error("codex app-server is not running.");
     const threadResponse = await this.rpc.request(
       input.providerSessionId ? "thread/resume" : "thread/start",
@@ -100,15 +117,9 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     const threadId = readString(asRecord(threadResponse)?.thread, "id");
     if (!threadId) throw new Error("codex app-server did not return a thread id.");
 
-    const turnResponse = await this.rpc.request("turn/start", turnParams(input, threadId));
-    const turnId = readString(asRecord(turnResponse)?.turn, "id");
-    const completed = await this.rpc.waitForNotification((event) => {
-      if (event.method !== "turn/completed") return false;
-      const params = asRecord(event.params);
-      const turn = asRecord(params?.turn);
-      return (turnId ? turn?.id === turnId : params?.threadId === threadId) && turn?.status !== undefined;
-    });
-    const parsed = parseCompletedTurn(completed.params, this.rpc.eventsForTurn(threadId, turnId));
+    await callbacks?.onSessionId?.(threadId);
+    const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+    const parsed = parseCompletedTurn(completed.event.params, completed.items);
     if (parsed.failure) throw new Error(`codex turn failed: ${parsed.failure}`);
     if (!parsed.finalResponse.trim()) {
       throw new Error("Codex did not return a final assistant response.");
@@ -188,6 +199,9 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     if (!command) {
       throw new Error("Codex provider is not available: codex executable not found.");
     }
+    if (!isCodexAppServerSupported(command.executable, this.env)) {
+      throw new Error("Codex provider is not available: the installed codex does not support app-server.");
+    }
     const runtime = new CodexAppServerRuntime({
       command: command.executable,
       env: codexCommandEnvironment(this.env),
@@ -203,22 +217,34 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
   }
 }
 
+const MAX_TURN_ITEMS = 10_000;
+const MAX_STDERR_BYTES = 32 * 1024;
+
 interface CodexEvent {
   method: string;
   params?: unknown;
 }
 
+interface CodexTurnResult {
+  event: CodexEvent;
+  items: unknown[];
+}
+
+interface CodexTurnAccumulator {
+  threadId: string;
+  turnId?: string;
+  items: unknown[];
+  completed?: CodexEvent;
+  resolve: (result: CodexTurnResult) => void;
+  reject: (error: Error) => void;
+}
+
 class CodexAppServerRpc {
-  readonly events: CodexEvent[] = [];
   private readonly pending = new Map<string, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
   }>();
-  private readonly waiters: Array<{
-    predicate: (event: CodexEvent) => boolean;
-    resolve: (event: CodexEvent) => void;
-    reject: (error: Error) => void;
-  }> = [];
+  private readonly turns = new Map<string, CodexTurnAccumulator>();
   private nextId = 1;
   private fatalError?: Error;
   private buffer = "";
@@ -229,7 +255,9 @@ class CodexAppServerRpc {
     private readonly version?: string,
   ) {
     createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => this.handleLine(line));
-    child.stderr.on("data", (chunk: Buffer) => { this.stderr += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.stderr = appendTail(this.stderr, chunk.toString("utf8"), MAX_STDERR_BYTES);
+    });
   }
 
   request(method: string, params?: unknown): Promise<unknown> {
@@ -245,31 +273,39 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  waitForNotification(predicate: (event: CodexEvent) => boolean): Promise<CodexEvent> {
-    if (this.fatalError) return Promise.reject(this.fatalError);
-    const existing = this.events.find(predicate);
-    if (existing) return Promise.resolve(existing);
-    return new Promise((resolve, reject) => this.waiters.push({ predicate, resolve, reject }));
-  }
-
-  eventsForTurn(threadId: string, turnId: string | undefined): unknown[] {
-    return this.events
-      .filter((event) => {
-        const params = asRecord(event.params);
-        if (params?.threadId === threadId) return !turnId || params.turnId === turnId || asRecord(params.turn)?.id === turnId;
-        return !turnId || asRecord(params?.turn)?.id === turnId;
-      })
-      .map((event) => asRecord(event.params)?.item)
-      .filter((item): item is Record<string, unknown> => Boolean(asRecord(item)));
+  async runTurn(threadId: string, params: unknown): Promise<CodexTurnResult> {
+    if (this.fatalError) throw this.fatalError;
+    if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
+    let resolveTurn!: (result: CodexTurnResult) => void;
+    let rejectTurn!: (error: Error) => void;
+    const completion = new Promise<CodexTurnResult>((resolve, reject) => {
+      resolveTurn = resolve;
+      rejectTurn = reject;
+    });
+    const turn: CodexTurnAccumulator = {
+      threadId,
+      items: [],
+      resolve: resolveTurn,
+      reject: rejectTurn,
+    };
+    this.turns.set(threadId, turn);
+    try {
+      const response = await this.request("turn/start", params);
+      turn.turnId = readString(asRecord(response)?.turn, "id");
+      if (turn.completed) return { event: turn.completed, items: turn.items };
+      return await completion;
+    } finally {
+      if (this.turns.get(threadId) === turn) this.turns.delete(threadId);
+    }
   }
 
   fail(error: Error): void {
     if (this.fatalError) return;
     this.fatalError = new Error(`${error.message}${this.stderr.trim() ? `\n${this.stderr.trim()}` : ""}${this.version ? `\ncodex version: ${this.version}` : ""}`);
     for (const pending of this.pending.values()) pending.reject(this.fatalError);
-    for (const waiter of this.waiters) waiter.reject(this.fatalError);
+    for (const turn of this.turns.values()) turn.reject(this.fatalError);
     this.pending.clear();
-    this.waiters.length = 0;
+    this.turns.clear();
   }
 
   private write(message: Record<string, unknown>): void {
@@ -305,13 +341,27 @@ class CodexAppServerRpc {
     }
     if (!method) return;
     const event = { method, params: message.params };
-    this.events.push(event);
-    for (let index = this.waiters.length - 1; index >= 0; index -= 1) {
-      const waiter = this.waiters[index]!;
-      if (!waiter.predicate(event)) continue;
-      this.waiters.splice(index, 1);
-      waiter.resolve(event);
+    const turn = this.findTurn(event);
+    if (!turn) return;
+    const params = asRecord(event.params);
+    if (params?.item !== undefined) {
+      turn.items.push(params.item);
+      if (turn.items.length > MAX_TURN_ITEMS) turn.items.shift();
     }
+    if (event.method !== "turn/completed" || !turnMatchesEvent(turn, event)) return;
+    turn.completed = event;
+    turn.resolve({ event, items: turn.items.slice() });
+  }
+
+  private findTurn(event: CodexEvent): CodexTurnAccumulator | undefined {
+    const params = asRecord(event.params);
+    const threadId = typeof params?.threadId === "string" ? params.threadId : undefined;
+    const turnId = typeof params?.turnId === "string"
+      ? params.turnId
+      : readString(asRecord(params?.turn), "id");
+    if (threadId) return this.turns.get(threadId);
+    if (!turnId) return undefined;
+    return Array.from(this.turns.values()).find((turn) => turn.turnId === turnId);
   }
 }
 
@@ -360,7 +410,7 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
   failure?: string;
 } {
   const turn = asRecord(asRecord(params)?.turn);
-  const completedItems = Array.isArray(turn?.items) ? turn.items : items;
+  const completedItems = (Array.isArray(turn?.items) ? turn.items : items).slice(-MAX_TURN_ITEMS);
   let finalResponse = "";
   for (const item of completedItems) {
     const record = asRecord(item);
@@ -387,7 +437,7 @@ export function codexAppServerError(message: string, version?: string, stderr?: 
 }
 
 function commandCandidates(command: string, env: NodeJS.ProcessEnv): string[] {
-  if (command.includes("/") || command.includes("\\")) return [command];
+  if (command.includes("/") || command.includes("\\") || /\.(?:cmd|bat|exe|com)$/i.test(command)) return [command];
   const path = env.PATH;
   if (!path) return [command];
   const extensions = process.platform === "win32"
@@ -396,6 +446,21 @@ function commandCandidates(command: string, env: NodeJS.ProcessEnv): string[] {
   return path.split(delimiter)
     .filter(Boolean)
     .flatMap((directory) => extensions.map((extension) => resolve(directory, `${command}${extension}`)));
+}
+
+function usesWindowsCommandShell(command: string): boolean {
+  return process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command);
+}
+
+function turnMatchesEvent(turn: CodexTurnAccumulator, event: CodexEvent): boolean {
+  const params = asRecord(event.params);
+  const eventThreadId = typeof params?.threadId === "string" ? params.threadId : undefined;
+  const eventTurnId = typeof params?.turnId === "string"
+    ? params.turnId
+    : readString(asRecord(params?.turn), "id");
+  if (eventThreadId && eventThreadId !== turn.threadId) return false;
+  if (turn.turnId && eventTurnId && turn.turnId !== eventTurnId) return false;
+  return eventThreadId === turn.threadId || Boolean(turn.turnId && eventTurnId === turn.turnId);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -423,4 +488,11 @@ function protocolErrorText(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function appendTail(value: string, chunk: string, maxBytes: number): string {
+  const next = value + chunk;
+  if (Buffer.byteLength(next, "utf8") <= maxBytes) return next;
+  const bytes = Buffer.from(next, "utf8");
+  return bytes.subarray(bytes.length - maxBytes).toString("utf8");
 }

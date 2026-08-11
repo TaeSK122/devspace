@@ -56,19 +56,21 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const runtime = new CodexAppServerRuntime({ command, env: process.env });
   try {
     await runtime.initialize();
+    let callbackSessionId: string | undefined;
     const first = await runtime.run({
       prompt: "first",
       workspace: "/tmp/project",
       writeMode: "read_only",
       model: "gpt-5.4",
       thinking: "high",
-    });
+    }, { onSessionId: (id) => { callbackSessionId = id; } });
     const resumed = await runtime.run({
       prompt: "resumed",
       workspace: "/tmp/project",
       providerSessionId: first.providerSessionId ?? undefined,
     });
     assert.equal(first.providerSessionId, "thread_new");
+    assert.equal(callbackSessionId, "thread_new");
     assert.equal(first.finalResponse, "fake response 1");
     assert.equal(resumed.providerSessionId, "thread_new");
     assert.equal(resumed.finalResponse, "fake response 2");
