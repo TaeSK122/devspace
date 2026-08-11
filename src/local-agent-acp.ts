@@ -4,13 +4,18 @@ import { Readable, Writable } from "node:stream";
 import { terminateProcessTree } from "./process-platform.js";
 import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
+  LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
 
 export type AcpProvider = "cursor" | "copilot";
+
+const MAX_ACP_QUEUE_ITEMS = 10_000;
+const MAX_ACP_STDERR_BYTES = 32 * 1024;
 
 const ACP_COMMANDS: Record<AcpProvider, [string, ...string[]]> = {
   cursor: ["cursor-agent", "acp"],
@@ -37,6 +42,9 @@ export interface AcpRuntimeOptions {
   child?: ChildProcessWithoutNullStreams;
   capabilities?: { resume: boolean; close: boolean };
   queues?: Map<string, AcpSessionQueue>;
+  liveSessions?: Set<string>;
+  sessionWriteModes?: Map<string, LocalAgentWriteMode>;
+  sessionMetadata?: Map<string, unknown>;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -45,6 +53,9 @@ export class AcpRuntime implements LocalAgentRuntime {
   private readonly connection: AcpConnectionLike;
   private readonly capabilities: { resume: boolean; close: boolean };
   private readonly queues: Map<string, AcpSessionQueue>;
+  private readonly liveSessions: Set<string>;
+  private readonly sessionWriteModes: Map<string, LocalAgentWriteMode>;
+  private readonly sessionMetadata: Map<string, unknown>;
   private alive = true;
   private closed = false;
 
@@ -54,6 +65,9 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.connection = connection;
     this.capabilities = options.capabilities ?? { resume: false, close: false };
     this.queues = options.queues ?? new Map();
+    this.liveSessions = options.liveSessions ?? new Set();
+    this.sessionWriteModes = options.sessionWriteModes ?? new Map();
+    this.sessionMetadata = options.sessionMetadata ?? new Map();
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
     }).catch(() => {
@@ -69,9 +83,9 @@ export class AcpRuntime implements LocalAgentRuntime {
     });
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.isAlive()) throw new Error(`${this.provider} ACP runtime is not running.`);
-    const sessionId = await this.openSession(input);
+    const sessionId = await this.openSession(input, callbacks);
     const queue = this.queues.get(sessionId) ?? { values: [] };
     this.queues.set(sessionId, queue);
     queue.values.length = 0;
@@ -94,9 +108,12 @@ export class AcpRuntime implements LocalAgentRuntime {
   }
 
   async releaseSession(providerSessionId: string): Promise<void> {
-    if (!this.capabilities.close || !this.isAlive()) return;
-    await this.connection.agent.request("session/close", { sessionId: providerSessionId });
     this.queues.delete(providerSessionId);
+    this.liveSessions.delete(providerSessionId);
+    this.sessionWriteModes.delete(providerSessionId);
+    this.sessionMetadata.delete(providerSessionId);
+    if (!this.capabilities.close || !this.capabilities.resume || !this.isAlive()) return;
+    await this.connection.agent.request("session/close", { sessionId: providerSessionId });
   }
 
   isAlive(): boolean {
@@ -107,6 +124,10 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (this.closed) return;
     this.closed = true;
     this.alive = false;
+    this.queues.clear();
+    this.liveSessions.clear();
+    this.sessionWriteModes.clear();
+    this.sessionMetadata.clear();
     this.connection.close(new Error(`${this.provider} ACP runtime closed.`));
     if (this.child && this.child.exitCode === null) {
       const detached = process.platform !== "win32";
@@ -117,8 +138,19 @@ export class AcpRuntime implements LocalAgentRuntime {
     }
   }
 
-  private async openSession(input: LocalAgentRunInput): Promise<string> {
+  private async openSession(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<string> {
     if (input.providerSessionId) {
+      if (this.liveSessions.has(input.providerSessionId)) {
+        this.sessionWriteModes.set(input.providerSessionId, input.writeMode ?? "allowed");
+        await callbacks?.onSessionId?.(input.providerSessionId);
+        await this.configureSession(
+          input.providerSessionId,
+          input,
+          this.sessionMetadata.get(input.providerSessionId),
+          false,
+        );
+        return input.providerSessionId;
+      }
       if (!this.capabilities.resume) {
         throw new Error(`${this.provider} ACP does not advertise session resume support.`);
       }
@@ -127,8 +159,12 @@ export class AcpRuntime implements LocalAgentRuntime {
         cwd: input.workspace,
         mcpServers: [],
       });
+      this.cacheSessionMetadata(input.providerSessionId, response);
       this.queues.set(input.providerSessionId, { values: [] });
-      await this.configureSession(input.providerSessionId, input, response);
+      this.liveSessions.add(input.providerSessionId);
+      this.sessionWriteModes.set(input.providerSessionId, input.writeMode ?? "allowed");
+      await callbacks?.onSessionId?.(input.providerSessionId);
+      await this.configureSession(input.providerSessionId, input, response, false);
       return input.providerSessionId;
     }
 
@@ -138,23 +174,38 @@ export class AcpRuntime implements LocalAgentRuntime {
     });
     const sessionId = readString(response, "sessionId");
     if (!sessionId) throw new Error(`${this.provider} ACP did not return a session id.`);
+    this.cacheSessionMetadata(sessionId, response);
     this.queues.set(sessionId, { values: [] });
-    await this.configureSession(sessionId, input, response);
+    this.liveSessions.add(sessionId);
+    this.sessionWriteModes.set(sessionId, input.writeMode ?? "allowed");
+    await callbacks?.onSessionId?.(sessionId);
+    await this.configureSession(sessionId, input, response, true);
     return sessionId;
+  }
+
+  private cacheSessionMetadata(sessionId: string, response: unknown): void {
+    if (hasAcpConfigOptions(response)) this.sessionMetadata.set(sessionId, response);
   }
 
   private async configureSession(
     sessionId: string,
     input: LocalAgentRunInput,
     response?: unknown,
+    isNewSession = false,
   ): Promise<void> {
+    const metadata = response ?? this.sessionMetadata.get(sessionId);
+    const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
     if (input.model) {
-      const config = resolveAcpModelConfigUpdate(response, input.model, this.provider, sessionId);
-      await this.connection.agent.request("session/set_config_option", config);
+      if (canConfigure) {
+        const config = resolveAcpModelConfigUpdate(metadata, input.model, this.provider, sessionId);
+        await this.connection.agent.request("session/set_config_option", config);
+      }
     }
     if (input.thinking) {
-      const config = resolveAcpThinkingConfigUpdate(response, input.thinking, this.provider, sessionId);
-      await this.connection.agent.request("session/set_config_option", config);
+      if (canConfigure) {
+        const config = resolveAcpThinkingConfigUpdate(metadata, input.thinking, this.provider, sessionId);
+        await this.connection.agent.request("session/set_config_option", config);
+      }
     }
   }
 }
@@ -183,6 +234,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
+      shell: process.platform === "win32" && isWindowsShellCommand(command),
       windowsHide: true,
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
@@ -190,12 +242,19 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     }
 
     let connection: AcpConnectionLike | undefined;
+    child.stderr.setEncoding("utf8");
+    let stderrTail = "";
+    child.stderr.on("data", (chunk: string) => {
+      stderrTail = appendTail(stderrTail, chunk, MAX_ACP_STDERR_BYTES);
+    });
     try {
       const { client, methods, ndJsonStream } = await import("@agentclientprotocol/sdk");
       const queues = new Map<string, AcpSessionQueue>();
+      const sessionWriteModes = new Map<string, LocalAgentWriteMode>();
       const app = client({ name: "DevSpace" })
         .onRequest(methods.client.session.requestPermission, (context) => {
-          const selected = selectAcpAllowPermissionOption(context.params.options);
+          const writeMode = queuesWriteMode(context.params.sessionId, sessionWriteModes);
+          const selected = selectAcpPermissionOption(context.params.options, writeMode);
           return selected
             ? { outcome: { outcome: "selected", optionId: selected.optionId } }
             : { outcome: { outcome: "cancelled" } };
@@ -203,7 +262,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
         .onNotification(methods.client.session.update, (context) => {
           const sessionId = context.params.sessionId;
           const queue = queues.get(sessionId);
-          if (queue) queue.values.push(context.params);
+          if (queue) appendAcpQueueValue(queue, context.params);
         });
       const stream = ndJsonStream(
         Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
@@ -224,6 +283,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
         child,
         capabilities,
         queues,
+        sessionWriteModes,
       }, connection);
     } catch (error) {
       try {
@@ -237,6 +297,9 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
         if (!await waitForProcessExit(child, 1_000)) {
           terminateProcessTree(child, "SIGKILL", detached);
         }
+      }
+      if (stderrTail.trim() && error instanceof Error && !error.message.includes(stderrTail.trim())) {
+        throw new Error(`${error.message}\n${stderrTail.trim()}`, { cause: error });
       }
       throw error;
     }
@@ -363,8 +426,26 @@ export function flattenAcpSelectValues(option: Record<string, unknown>): string[
 export function selectAcpAllowPermissionOption(
   options: Array<{ optionId: string; kind: string }>,
 ): { optionId: string } | undefined {
-  return options.find((option) => option.kind === "allow_once")
-    ?? options.find((option) => option.kind === "allow_always");
+  return selectAcpPermissionOption(options, "allowed");
+}
+
+export function selectAcpPermissionOption(
+  options: Array<{ optionId: string; kind: string }>,
+  writeMode: LocalAgentWriteMode | undefined,
+): { optionId: string } | undefined {
+  const selected = writeMode === "read_only"
+    ? options.find((option) => option.kind === "reject_once")
+      ?? options.find((option) => option.kind === "reject_always")
+    : options.find((option) => option.kind === "allow_once")
+      ?? options.find((option) => option.kind === "allow_always");
+  return selected ? { optionId: selected.optionId } : undefined;
+}
+
+function queuesWriteMode(
+  sessionId: string,
+  sessionWriteModes: Map<string, LocalAgentWriteMode>,
+): LocalAgentWriteMode {
+  return sessionWriteModes.get(sessionId) ?? "allowed";
 }
 
 function readAcpCapabilities(value: unknown): { resume: boolean; close: boolean } {
@@ -389,10 +470,32 @@ function extractAcpText(updates: unknown[]): string {
     .trim();
 }
 
+function hasAcpConfigOptions(value: unknown): boolean {
+  const record = asRecord(value);
+  const response = asRecord(record?.newSessionResponse) ?? record;
+  return Array.isArray(response?.configOptions);
+}
+
+function appendAcpQueueValue(queue: AcpSessionQueue, value: unknown): void {
+  if (queue.values.length >= MAX_ACP_QUEUE_ITEMS) queue.values.shift();
+  queue.values.push(value);
+}
+
+function appendTail(current: string, chunk: string, maxBytes: number): string {
+  const next = current + chunk;
+  if (Buffer.byteLength(next, "utf8") <= maxBytes) return next;
+  return Buffer.from(next, "utf8").subarray(-maxBytes).toString("utf8");
+}
+
+function isWindowsShellCommand(command: string): boolean {
+  return /\.(?:bat|cmd)$/i.test(command);
+}
+
 function executableExists(command: string, env: NodeJS.ProcessEnv): boolean {
   const result = spawnSync(command, ["--version"], {
     encoding: "utf8",
     env,
+    shell: process.platform === "win32" && isWindowsShellCommand(command),
     windowsHide: true,
     timeout: 5_000,
   });
