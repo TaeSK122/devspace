@@ -10,6 +10,8 @@ class FakeClaudeQuery implements ClaudeQueryLike, AsyncIterator<unknown> {
   private readonly iterator: AsyncIterator<ClaudeUserMessage>;
   closeCount = 0;
   model?: string;
+  permissionModes: string[] = [];
+  flagSettings: Array<Record<string, unknown>> = [];
 
   constructor(prompt: AsyncIterable<ClaudeUserMessage>) {
     this.iterator = prompt[Symbol.asyncIterator]();
@@ -36,6 +38,14 @@ class FakeClaudeQuery implements ClaudeQueryLike, AsyncIterator<unknown> {
     this.closeCount += 1;
   }
 
+  async setPermissionMode(mode: string): Promise<void> {
+    this.permissionModes.push(mode);
+  }
+
+  async applyFlagSettings(settings: Record<string, unknown>): Promise<void> {
+    this.flagSettings.push({ ...settings });
+  }
+
   async setModel(model?: string): Promise<void> {
     this.model = model;
   }
@@ -47,6 +57,7 @@ const context: LocalAgentRuntimeContext = {
   workspace: "/tmp/project",
   model: "sonnet",
   thinking: "high",
+  writeMode: "read_only",
 };
 let factoryCalls = 0;
 let lastOptions: Record<string, unknown> | undefined;
@@ -59,21 +70,42 @@ const driver = new ClaudeLocalAgentDriver(({ prompt, options }) => {
 }, { PATH: "/usr/bin" });
 
 const runtime = await driver.createRuntime(context);
+const sessionIds: string[] = [];
 const first = await runtime.run({
   prompt: "first",
   workspace: "/tmp/project",
   model: "sonnet",
   thinking: "high",
+  writeMode: "read_only",
+}, {
+  onSessionId: (sessionId) => { sessionIds.push(sessionId); },
 });
 const second = await runtime.run({
   prompt: "second",
   workspace: "/tmp/project",
+  thinking: "low",
+  writeMode: "allowed",
+});
+await runtime.run({
+  prompt: "third",
+  workspace: "/tmp/project",
+  thinking: "high",
+  writeMode: "full_access",
 });
 assert.equal(factoryCalls, 1, "successive turns reuse one Claude query");
 assert.equal(first.providerSessionId, "claude_session_1");
 assert.equal(second.finalResponse, "response:second");
 assert.equal(query?.model, "sonnet");
 assert.equal(lastOptions?.resume, undefined);
+assert.equal(lastOptions?.permissionMode, "plan");
+assert.equal(lastOptions?.allowDangerouslySkipPermissions, true);
+assert.deepEqual(sessionIds, ["claude_session_1"]);
+assert.deepEqual(query?.permissionModes, ["plan", "acceptEdits", "bypassPermissions"]);
+assert.deepEqual(query?.flagSettings, [
+  { alwaysThinkingEnabled: true, effortLevel: "high" },
+  { alwaysThinkingEnabled: true, effortLevel: "low" },
+  { alwaysThinkingEnabled: true, effortLevel: "high" },
+]);
 
 await runtime.close();
 await runtime.close();

@@ -2,14 +2,20 @@ import { spawnSync } from "node:child_process";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
+  LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
+
+type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
 
 export interface ClaudeQueryLike extends AsyncIterable<unknown> {
   close(): void;
+  setPermissionMode(mode: ClaudePermissionMode): Promise<void>;
+  applyFlagSettings(settings: Record<string, unknown>): Promise<void>;
   setModel?(model?: string): Promise<void>;
 }
 
@@ -72,8 +78,16 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
     this.iterator = query[Symbol.asyncIterator]();
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.isAlive()) throw new Error("Claude runtime is not running.");
+    if (this.providerSessionId) await callbacks?.onSessionId?.(this.providerSessionId);
+    await this.query.setPermissionMode(claudePermissionMode(input.writeMode));
+    if (input.thinking) {
+      await this.query.applyFlagSettings({
+        alwaysThinkingEnabled: true,
+        effortLevel: input.thinking,
+      });
+    }
     if (input.model && this.query.setModel) await this.query.setModel(input.model);
     this.inputQueue.push({
       type: "user",
@@ -97,7 +111,13 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
       const message = next.value;
       items.push(message);
       const record = asRecord(message);
-      if (typeof record?.session_id === "string") this.providerSessionId = record.session_id;
+      if (typeof record?.session_id === "string") {
+        const previousSessionId = this.providerSessionId;
+        this.providerSessionId = record.session_id;
+        if (previousSessionId !== this.providerSessionId) {
+          await callbacks?.onSessionId?.(this.providerSessionId);
+        }
+      }
       if (record?.type !== "result") continue;
 
       const resultError = claudeResultError(record);
@@ -149,6 +169,7 @@ export class ClaudeLocalAgentDriver implements LocalAgentDriver {
       prompt: "",
       workspace: context.workspace,
       providerSessionId: context.providerSessionId,
+      writeMode: context.writeMode,
       model: context.model,
       thinking: context.thinking,
     };
@@ -178,16 +199,31 @@ export function claudeQueryOptions(
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, unknown> {
   const executable = env.CLAUDE_COMMAND ?? resolveExecutable("claude", env);
+  const permissionMode = claudePermissionMode(input.writeMode);
   return {
     cwd: input.workspace,
     ...(input.model ? { model: input.model } : {}),
     ...(input.thinking ? { thinking: { type: "adaptive" }, effort: input.thinking } : {}),
     ...(context.providerSessionId ? { resume: context.providerSessionId } : {}),
-    permissionMode: "bypassPermissions",
+    permissionMode,
+    // This flag only permits a later explicit switch to bypassPermissions; the
+    // active permissionMode remains the authority for each turn.
     allowDangerouslySkipPermissions: true,
     env: claudeCommandEnvironment(env),
     ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
   };
+}
+
+export function claudePermissionMode(
+  writeMode: LocalAgentWriteMode | undefined,
+): ClaudePermissionMode {
+  switch (writeMode) {
+    case "read_only": return "plan";
+    case "full_access": return "bypassPermissions";
+    case "allowed":
+    case undefined:
+      return "acceptEdits";
+  }
 }
 
 export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
