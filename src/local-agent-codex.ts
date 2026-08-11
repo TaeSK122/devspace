@@ -4,6 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
+import { terminateProcessTree } from "./process-platform.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunInput,
@@ -66,6 +67,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     this.child = spawn(options.command, ["app-server"], {
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
       windowsHide: true,
     });
     this.rpc = new CodexAppServerRpc(this.child, options.version);
@@ -138,10 +140,34 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
       this.alive = false;
       this.rpc.fail(new Error("codex app-server closed."));
       if (!this.child.stdin.destroyed) this.child.stdin.end();
-      if (!this.child.killed && this.child.exitCode === null) this.child.kill();
+      if (this.child.exitCode === null) {
+        terminateProcessTree(this.child, "SIGTERM", process.platform !== "win32");
+        if (!await waitForProcessExit(this.child, 1_000)) {
+          terminateProcessTree(this.child, "SIGKILL", process.platform !== "win32");
+        }
+      }
     })();
     return this.closePromise;
   }
+}
+
+async function waitForProcessExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (child.exitCode !== null) return true;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    timer.unref();
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    child.once("exit", onExit);
+  });
 }
 
 export class CodexLocalAgentDriver implements LocalAgentDriver {
