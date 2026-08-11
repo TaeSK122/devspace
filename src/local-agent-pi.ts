@@ -1,11 +1,17 @@
 import { join } from "node:path";
 import type {
   LocalAgentDriver,
+  LocalAgentRunCallbacks,
   LocalAgentRunInput,
   LocalAgentRunResult,
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
+
+const PI_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
+const PI_WORKSPACE_TOOLS = ["read", "grep", "find", "ls", "edit", "write"] as const;
+const PI_FULL_ACCESS_TOOLS = [...PI_WORKSPACE_TOOLS, "bash"] as const;
+const MAX_PI_EVENTS = 10_000;
 
 export interface PiSessionLike {
   readonly sessionId: string;
@@ -13,6 +19,7 @@ export interface PiSessionLike {
   readonly modelRegistry?: { find(provider: string, modelId: string): unknown };
   prompt(text: string): Promise<void>;
   subscribe(listener: (event: unknown) => void): () => void;
+  setActiveToolsByName(toolNames: string[]): void;
   setModel?(model: unknown): Promise<void>;
   setThinkingLevel?(level: unknown): void;
   dispose(): void;
@@ -35,12 +42,15 @@ export class PiSessionRuntime implements LocalAgentRuntime {
     private readonly session: PiSessionLike,
   ) {
     this.unsubscribe = session.subscribe((event) => {
-      if (this.collectingEvents) this.events.push(event);
+      if (!this.collectingEvents) return;
+      if (this.events.length >= MAX_PI_EVENTS) this.events.shift();
+      this.events.push(event);
     });
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.isAlive()) throw new Error("Pi runtime is not running.");
+    await callbacks?.onSessionId?.(this.session.sessionId);
     await this.applyOverrides(input);
     this.events = [];
     const messageStart = this.session.state.messages.length;
@@ -81,6 +91,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
   }
 
   private async applyOverrides(input: LocalAgentRunInput): Promise<void> {
+    this.session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
     if (input.model && this.session.modelRegistry && this.session.setModel) {
       const model = resolvePiModel(this.session.modelRegistry, input.model);
       if (!model) throw new Error(`Pi model not found: ${input.model}`);
@@ -135,9 +146,6 @@ async function defaultPiSessionFactory(
   const sessionManager = await resolveSessionManager(SessionManager, input.workspace, input.providerSessionId);
   const model = input.model ? resolvePiModel(modelRegistry, input.model) : undefined;
   if (input.model && !model) throw new Error(`Pi model not found: ${input.model}`);
-  const tools = input.writeMode === "read_only"
-    ? ["read", "grep", "find", "ls"]
-    : undefined;
   const result = await createAgentSession({
     cwd: input.workspace,
     agentDir,
@@ -146,9 +154,24 @@ async function defaultPiSessionFactory(
     sessionManager: sessionManager as never,
     ...(model ? { model: model as never } : {}),
     ...(input.thinking ? { thinkingLevel: input.thinking as never } : {}),
-    ...(tools ? { tools } : {}),
+    // Keep the full built-in registry available so warm turns can narrow or
+    // broaden active tools without recreating the session.
+    tools: [...PI_FULL_ACCESS_TOOLS],
   });
-  return result.session as unknown as PiSessionLike;
+  const session = result.session as unknown as PiSessionLike;
+  session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
+  return session;
+}
+
+function piToolsForWriteMode(writeMode: LocalAgentRunInput["writeMode"]): readonly string[] {
+  switch (writeMode) {
+    case "read_only": return PI_READ_ONLY_TOOLS;
+    case "full_access": return PI_FULL_ACCESS_TOOLS;
+    case "allowed":
+    case undefined:
+      // Pi's bash tool is not workspace-sandboxed, so reserve it for full access.
+      return PI_WORKSPACE_TOOLS;
+  }
 }
 
 interface PiSessionManagerApi {
