@@ -17,6 +17,7 @@ import {
   type LocalAgentDriver,
 } from "./local-agent-runtime.js";
 import { LOCAL_AGENT_PROVIDERS } from "./local-agent-profiles.js";
+import { AcpLocalAgentDriver } from "./local-agent-acp.js";
 import { CodexLocalAgentDriver } from "./local-agent-codex.js";
 import { OpencodeLocalAgentDriver } from "./local-agent-opencode.js";
 
@@ -60,6 +61,8 @@ export function createLocalAgentDrivers(): LocalAgentDriver[] {
       ? new CodexLocalAgentDriver()
       : provider === "opencode"
         ? new OpencodeLocalAgentDriver()
+        : provider === "cursor" || provider === "copilot"
+          ? new AcpLocalAgentDriver(provider)
         : new LegacyLocalAgentDriver(provider));
 }
 
