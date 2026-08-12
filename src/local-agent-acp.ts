@@ -30,6 +30,12 @@ interface AcpConnectionLike {
   closed: Promise<void>;
 }
 
+interface AcpCapabilities {
+  resume: boolean;
+  close: boolean;
+  additionalDirectories?: boolean;
+}
+
 interface AcpSessionQueue {
   values: unknown[];
 }
@@ -40,7 +46,7 @@ export interface AcpRuntimeOptions {
   args: string[];
   env: NodeJS.ProcessEnv;
   child?: ChildProcessWithoutNullStreams;
-  capabilities?: { resume: boolean; close: boolean };
+  capabilities?: AcpCapabilities;
   queues?: Map<string, AcpSessionQueue>;
   liveSessions?: Set<string>;
   sessionWriteModes?: Map<string, LocalAgentWriteMode>;
@@ -51,7 +57,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   readonly provider: AcpProvider;
   private readonly child?: ChildProcessWithoutNullStreams;
   private readonly connection: AcpConnectionLike;
-  private readonly capabilities: { resume: boolean; close: boolean };
+  private readonly capabilities: AcpCapabilities;
   private readonly queues: Map<string, AcpSessionQueue>;
   private readonly liveSessions: Set<string>;
   private readonly sessionWriteModes: Map<string, LocalAgentWriteMode>;
@@ -158,6 +164,7 @@ export class AcpRuntime implements LocalAgentRuntime {
         sessionId: input.providerSessionId,
         cwd: input.workspace,
         mcpServers: [],
+        ...this.additionalDirectoryParams(),
       });
       this.cacheSessionMetadata(input.providerSessionId, response);
       this.queues.set(input.providerSessionId, { values: [] });
@@ -171,6 +178,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     const response = await this.connection.agent.request("session/new", {
       cwd: input.workspace,
       mcpServers: [],
+      ...this.additionalDirectoryParams(),
     });
     const sessionId = readString(response, "sessionId");
     if (!sessionId) throw new Error(`${this.provider} ACP did not return a session id.`);
@@ -195,18 +203,26 @@ export class AcpRuntime implements LocalAgentRuntime {
   ): Promise<void> {
     const metadata = response ?? this.sessionMetadata.get(sessionId);
     const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
+    if (!canConfigure && (input.model || input.thinking)) {
+      const requested = [input.model ? "model" : undefined, input.thinking ? "thinking" : undefined]
+        .filter(Boolean)
+        .join(" and ");
+      throw new Error(
+        `${this.provider} ACP cannot apply the requested ${requested} override on this session: the provider did not advertise configurable options after resume.`,
+      );
+    }
     if (input.model) {
-      if (canConfigure) {
-        const config = resolveAcpModelConfigUpdate(metadata, input.model, this.provider, sessionId);
-        await this.connection.agent.request("session/set_config_option", config);
-      }
+      const config = resolveAcpModelConfigUpdate(metadata, input.model, this.provider, sessionId);
+      await this.connection.agent.request("session/set_config_option", config);
     }
     if (input.thinking) {
-      if (canConfigure) {
-        const config = resolveAcpThinkingConfigUpdate(metadata, input.thinking, this.provider, sessionId);
-        await this.connection.agent.request("session/set_config_option", config);
-      }
+      const config = resolveAcpThinkingConfigUpdate(metadata, input.thinking, this.provider, sessionId);
+      await this.connection.agent.request("session/set_config_option", config);
     }
+  }
+
+  private additionalDirectoryParams(): { additionalDirectories?: string[] } {
+    return this.capabilities.additionalDirectories ? { additionalDirectories: [] } : {};
   }
 }
 
@@ -215,23 +231,29 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
   // Keep ACP warm briefly, then let the generic pool close the process so the
   // daemon can reach its own idle shutdown state.
   readonly idleTimeoutMs = 5 * 60_000;
+  private commandResolved = false;
+  private resolvedCommand?: string;
 
   constructor(
     provider: AcpProvider,
     private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly commandResolver: AcpCommandResolver = resolveAcpCommand,
   ) {
     this.provider = provider;
   }
 
-  runtimeKey(_context: LocalAgentRuntimeContext): string {
-    const command = resolveAcpCommand(this.provider, this.env);
-    return `acp:${this.provider}:${command ?? ACP_COMMANDS[this.provider][0]}`;
+  runtimeKey(context: LocalAgentRuntimeContext): string {
+    const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
+    const writeMode = context.writeMode ?? "allowed";
+    const workspace = writeMode === "full_access" ? "shared" : resolve(context.workspace);
+    return `acp:${this.provider}:${command}:${writeMode}:${workspace}`;
   }
 
-  async createRuntime(_context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
-    const command = resolveAcpCommand(this.provider, this.env);
+  async createRuntime(context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
+    const command = this.resolveCommand();
     if (!command) throw new Error(`${this.provider} provider is not available: executable not found.`);
-    const child = spawn(command, ACP_COMMANDS[this.provider].slice(1), {
+    const args = acpCommandArgs(this.provider, context);
+    const child = spawn(command, args, {
       cwd: process.cwd(),
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -280,7 +302,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       return new AcpRuntime({
         provider: this.provider,
         command,
-        args: ACP_COMMANDS[this.provider].slice(1),
+        args,
         env: this.env,
         child,
         capabilities,
@@ -305,6 +327,14 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       }
       throw error;
     }
+  }
+
+  private resolveCommand(): string | undefined {
+    if (!this.commandResolved) {
+      this.resolvedCommand = this.commandResolver(this.provider, this.env);
+      this.commandResolved = true;
+    }
+    return this.resolvedCommand;
   }
 }
 
@@ -346,6 +376,29 @@ export function resolveAcpCommand(
     }
   }
   return undefined;
+}
+
+export type AcpCommandResolver = (provider: AcpProvider, env: NodeJS.ProcessEnv) => string | undefined;
+
+export function acpCommandArgs(provider: AcpProvider, context: LocalAgentRuntimeContext): string[] {
+  const writeMode = context.writeMode ?? "allowed";
+  if (provider === "cursor") {
+    return [
+      "acp",
+      "--sandbox", writeMode === "full_access" ? "disabled" : "enabled",
+      "--workspace", resolve(context.workspace),
+      ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
+      ...(writeMode === "full_access" ? ["--force"] : []),
+    ];
+  }
+  return [
+    "--acp",
+    ...(writeMode === "full_access"
+      ? ["--allow-all"]
+      : ["--allow-all-tools", "--add-dir", resolve(context.workspace)]),
+    "-C", resolve(context.workspace),
+    ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
+  ];
 }
 
 export function resolveAcpModelConfigUpdate(
@@ -450,12 +503,13 @@ function queuesWriteMode(
   return sessionWriteModes.get(sessionId) ?? "allowed";
 }
 
-function readAcpCapabilities(value: unknown): { resume: boolean; close: boolean } {
+function readAcpCapabilities(value: unknown): AcpCapabilities {
   const capabilities = asRecord(asRecord(value)?.agentCapabilities);
   const sessions = asRecord(capabilities?.sessionCapabilities);
   return {
     resume: Boolean(sessions?.resume),
     close: Boolean(sessions?.close),
+    additionalDirectories: sessions?.additionalDirectories !== undefined && sessions?.additionalDirectories !== null,
   };
 }
 

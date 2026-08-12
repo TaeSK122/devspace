@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
+  AcpLocalAgentDriver,
   AcpRuntime,
+  acpCommandArgs,
   selectAcpPermissionOption,
 } from "./local-agent-acp.js";
 
@@ -50,7 +52,7 @@ const runtime = new AcpRuntime({
   command: "cursor-agent",
   args: ["acp"],
   env: {},
-  capabilities: { resume: true, close: true },
+  capabilities: { resume: true, close: true, additionalDirectories: true },
   queues,
 }, connection);
 
@@ -80,6 +82,7 @@ assert.deepEqual(sessionIds, ["cursor_session_1", "cursor_session_1"]);
 assert.equal(requests.filter(({ method }) => method === "session/new").length, 1);
 assert.equal(requests.filter(({ method }) => method === "session/resume").length, 0);
 assert.equal(requests.filter(({ method }) => method === "session/set_config_option").length, 4);
+assert.deepEqual((requests.find(({ method }) => method === "session/new")?.params as Record<string, unknown>).additionalDirectories, []);
 
 await runtime.releaseSession("cursor_session_1");
 assert.equal(queues.has("cursor_session_1"), false);
@@ -94,13 +97,16 @@ const resumedRuntime = new AcpRuntime({
   capabilities: { resume: true, close: false },
   queues,
 }, connection);
-const resumed = await resumedRuntime.run({
-  prompt: "resumed",
-  workspace: "/tmp/project",
-  providerSessionId: first.providerSessionId ?? undefined,
-  model: "model-that-is-not-advertised-after-resume",
-});
-assert.equal(resumed.finalResponse, "ACP response");
+await assert.rejects(
+  resumedRuntime.run({
+    prompt: "resumed",
+    workspace: "/tmp/project",
+    providerSessionId: first.providerSessionId ?? undefined,
+    model: "model-that-is-not-advertised-after-resume",
+  }),
+  /cannot apply the requested model override/,
+  "a cold ACP override must fail instead of silently using the old configuration",
+);
 assert.equal(requests.filter(({ method }) => method === "session/resume").length, 1);
 assert.equal(requests.filter(({ method }) => method === "session/set_config_option").length, 4);
 await resumedRuntime.releaseSession("cursor_session_1");
@@ -121,6 +127,27 @@ assert.deepEqual(
   ], "read_only"),
   { optionId: "reject" },
 );
+
+let resolverCalls = 0;
+const cachedDriver = new AcpLocalAgentDriver("cursor", {}, () => {
+  resolverCalls += 1;
+  return "/usr/local/bin/cursor-agent";
+});
+const cachedContext = {
+  agentId: "agt_acp",
+  provider: "cursor" as const,
+  workspace: "/tmp/project",
+  writeMode: "allowed" as const,
+};
+assert.equal(cachedDriver.runtimeKey(cachedContext), "acp:cursor:/usr/local/bin/cursor-agent:allowed:/tmp/project");
+assert.equal(cachedDriver.runtimeKey(cachedContext), "acp:cursor:/usr/local/bin/cursor-agent:allowed:/tmp/project");
+assert.equal(resolverCalls, 1, "ACP executable identity is resolved once per driver lifecycle");
+assert.deepEqual(acpCommandArgs("cursor", cachedContext), [
+  "acp", "--sandbox", "enabled", "--workspace", "/tmp/project",
+]);
+assert.deepEqual(acpCommandArgs("copilot", cachedContext), [
+  "--acp", "--allow-all-tools", "--add-dir", "/tmp/project", "-C", "/tmp/project",
+]);
 
 await resumedRuntime.close();
 await resumedRuntime.close();
