@@ -254,7 +254,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     if (!command) throw new Error(`${this.provider} provider is not available: executable not found.`);
     const args = acpCommandArgs(this.provider, context);
     const child = spawn(command, args, {
-      cwd: process.cwd(),
+      cwd: resolve(context.workspace),
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
@@ -391,8 +391,12 @@ export function acpCommandArgs(provider: AcpProvider, context: LocalAgentRuntime
       ...(writeMode === "full_access" ? ["--force"] : []),
     ];
   }
+  const sandboxArgs = writeMode === "full_access"
+    ? ["--no-sandbox"]
+    : ["--experimental", "--sandbox"];
   return [
     "--acp",
+    ...sandboxArgs,
     ...(writeMode === "full_access"
       ? ["--allow-all"]
       : ["--allow-all-tools", "--add-dir", resolve(context.workspace)]),

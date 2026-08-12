@@ -146,7 +146,13 @@ assert.deepEqual(acpCommandArgs("cursor", cachedContext), [
   "acp", "--sandbox", "enabled", "--workspace", "/tmp/project",
 ]);
 assert.deepEqual(acpCommandArgs("copilot", cachedContext), [
-  "--acp", "--allow-all-tools", "--add-dir", "/tmp/project", "-C", "/tmp/project",
+  "--acp", "--experimental", "--sandbox", "--allow-all-tools", "--add-dir", "/tmp/project", "-C", "/tmp/project",
+]);
+assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "read_only" }), [
+  "--acp", "--experimental", "--sandbox", "--allow-all-tools", "--add-dir", "/tmp/project", "-C", "/tmp/project", "--mode", "plan",
+]);
+assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "full_access" }), [
+  "--acp", "--no-sandbox", "--allow-all", "-C", "/tmp/project",
 ]);
 
 await resumedRuntime.close();
