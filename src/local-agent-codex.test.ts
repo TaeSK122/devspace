@@ -4,10 +4,24 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   CodexAppServerRuntime,
+  CodexLocalAgentDriver,
   codexCommandEnvironment,
   parseCodexVersion,
   sandboxFor,
 } from "./local-agent-codex.js";
+
+let resolverCalls = 0;
+const cachedDriver = new CodexLocalAgentDriver(
+  { CODEX_HOME: "/tmp/codex-home" },
+  () => {
+    resolverCalls += 1;
+    return { executable: "/usr/local/bin/codex", version: "1.2.3" };
+  },
+);
+const cachedContext = { agentId: "agt_test", provider: "codex" as const, workspace: "/tmp/project" };
+assert.equal(cachedDriver.runtimeKey(cachedContext), "codex:/usr/local/bin/codex:/tmp/codex-home");
+assert.equal(cachedDriver.runtimeKey(cachedContext), "codex:/usr/local/bin/codex:/tmp/codex-home");
+assert.equal(resolverCalls, 1, "Codex executable identity is resolved once per driver lifecycle");
 
 assert.equal(parseCodexVersion("codex-cli 0.9.1"), "0.9.1");
 assert.equal(sandboxFor("read_only"), "read-only");

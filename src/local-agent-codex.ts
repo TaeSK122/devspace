@@ -20,6 +20,8 @@ export interface ResolvedCodexCommand {
   version?: string;
 }
 
+export type CodexCommandResolver = (env: NodeJS.ProcessEnv) => ResolvedCodexCommand | undefined;
+
 export function codexCommandEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const next = { ...env };
   delete next.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
@@ -185,17 +187,23 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
   readonly provider = "codex" as const;
   readonly idleTimeoutMs = 5 * 60_000;
 
-  constructor(private readonly env: NodeJS.ProcessEnv = process.env) {}
+  private commandResolved = false;
+  private resolvedCommand?: ResolvedCodexCommand;
+
+  constructor(
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly commandResolver: CodexCommandResolver = resolveCodexCommand,
+  ) {}
 
   runtimeKey(_context: LocalAgentRuntimeContext): string {
-    const command = resolveCodexCommand(this.env);
+    const command = this.resolveCommand();
     const executable = command?.executable ?? this.env.CODEX_COMMAND ?? "codex";
     const codexHome = resolve(this.env.CODEX_HOME ?? join(homedir(), ".codex"));
     return `codex:${executable}:${codexHome}`;
   }
 
   async createRuntime(_context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
-    const command = resolveCodexCommand(this.env);
+    const command = this.resolveCommand();
     if (!command) {
       throw new Error("Codex provider is not available: codex executable not found.");
     }
@@ -214,6 +222,14 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
       await runtime.close();
       throw codexAppServerError(errorMessage(error), command.version);
     }
+  }
+
+  private resolveCommand(): ResolvedCodexCommand | undefined {
+    if (!this.commandResolved) {
+      this.resolvedCommand = this.commandResolver(this.env);
+      this.commandResolved = true;
+    }
+    return this.resolvedCommand;
   }
 }
 
