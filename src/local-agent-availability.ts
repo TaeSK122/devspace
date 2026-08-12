@@ -1,9 +1,5 @@
-import { resolveAcpCommand } from "./local-agent-acp.js";
-import {
-  codexCommandEnvironment,
-  isCodexAppServerSupported,
-  resolveCodexCommand,
-} from "./local-agent-codex.js";
+import { accessSync, constants } from "node:fs";
+import { delimiter, resolve } from "node:path";
 import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
@@ -34,18 +30,10 @@ export function checkLocalAgentProviderAvailability(
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
     case "pi":
       return packageAvailability(provider, "@earendil-works/pi-coding-agent");
-    case "cursor": {
-      const command = resolveAcpCommand(provider, env);
-      return command
-        ? { name: provider, available: true }
-        : { name: provider, available: false, reason: "cursor-agent executable not found" };
-    }
-    case "copilot": {
-      const command = resolveAcpCommand(provider, env);
-      return command
-        ? { name: provider, available: true }
-        : { name: provider, available: false, reason: "copilot executable not found" };
-    }
+    case "cursor":
+      return commandAvailability(provider, env.CURSOR_COMMAND ?? "cursor-agent", env);
+    case "copilot":
+      return commandAvailability(provider, env.COPILOT_COMMAND ?? "copilot", env);
   }
 }
 
@@ -92,12 +80,47 @@ function packageAvailability(
 }
 
 function codexAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
-  const command = resolveCodexCommand(env);
-  if (!command) {
-    return { name: "codex", available: false, reason: "codex executable not found" };
+  return commandAvailability("codex", env.CODEX_COMMAND ?? "codex", env);
+}
+
+function commandAvailability(
+  provider: LocalAgentProvider,
+  command: string,
+  env: NodeJS.ProcessEnv,
+): LocalAgentProviderAvailability {
+  if (resolveCommand(command, env)) return { name: provider, available: true };
+  return {
+    name: provider,
+    available: false,
+    reason: `${command} executable not found`,
+  };
+}
+
+function resolveCommand(command: string, env: NodeJS.ProcessEnv): string | undefined {
+  if (command.includes("/") || command.includes("\\")) {
+    return executableExists(command) ? command : undefined;
   }
-  if (!isCodexAppServerSupported(command.executable, codexCommandEnvironment(env))) {
-    return { name: "codex", available: false, reason: "codex app-server is not supported" };
+  const path = env.PATH;
+  if (!path) return undefined;
+  const extensions = process.platform === "win32"
+    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  for (const directory of path.split(delimiter)) {
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = resolve(directory, `${command}${extension}`);
+      if (executableExists(candidate)) return candidate;
+    }
   }
-  return { name: "codex", available: true };
+  return undefined;
+}
+
+function executableExists(command: string): boolean {
+  const mode = process.platform === "win32" ? constants.F_OK : constants.X_OK;
+  try {
+    accessSync(command, mode);
+    return true;
+  } catch {
+    return false;
+  }
 }
