@@ -138,6 +138,9 @@ export class LocalAgentManager {
   }
 
   list(scope: LocalAgentListScope = {}): LocalAgentRecord[] {
+    if (!scope.workspaceId && !scope.workspaceRoot) {
+      throw new Error("A workspace scope is required to list subagents.");
+    }
     return this.store.list(scope.workspaceRoot
       ? { ...scope, workspaceRoot: this.authorizeWorkspace(scope.workspaceRoot) }
       : scope);
@@ -312,7 +315,7 @@ export class LocalAgentManager {
     if (workspaceRoot !== record.workspaceRoot) {
       throw new Error(`Subagent ${record.id} belongs to a different workspace.`);
     }
-    if (record.workspaceId && record.workspaceId !== scope.workspaceId) {
+    if (record.workspaceId !== scope.workspaceId) {
       throw new Error(`Subagent ${record.id} belongs to a different workspace.`);
     }
   }
