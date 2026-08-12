@@ -169,12 +169,16 @@ export async function releasePiSandboxSession(session: object): Promise<void> {
   state.acquired = false;
   sandboxSessionCount = Math.max(0, sandboxSessionCount - 1);
   if (sandboxSessionCount !== 0) return;
-  try {
-    await SandboxManager.reset();
-  } finally {
-    sandboxInitialization = undefined;
-    windowsSandboxWorkspace = undefined;
-  }
+  const reset = async (): Promise<void> => {
+    try {
+      await SandboxManager.reset();
+    } finally {
+      sandboxInitialization = undefined;
+      windowsSandboxWorkspace = undefined;
+    }
+  };
+  if (process.platform === "win32") await enqueueWindowsSandbox(reset);
+  else await reset();
 }
 
 function dynamicTool<T extends { execute: (...args: any[]) => any }>(
@@ -289,7 +293,10 @@ function createSandboxedBashOperations(): BashOperations {
 async function acquirePiSandbox(state: PiSandboxSessionState): Promise<void> {
   if (state.acquired) return;
   if (process.platform === "win32") {
-    await ensureWindowsSandbox(state.workspace);
+    // Windows sandbox-runtime has process-global policy state. Serialize
+    // workspace changes with command execution so one session cannot reset
+    // another session's policy while its Bash command is running.
+    await enqueueWindowsSandbox(() => ensureWindowsSandbox(state.workspace));
   } else {
     await ensureSandboxInitialized();
   }
