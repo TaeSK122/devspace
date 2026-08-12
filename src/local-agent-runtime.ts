@@ -12,7 +12,7 @@ export interface LocalAgentRunInput {
 }
 
 export interface LocalAgentRunResult {
-  provider: string;
+  provider: LocalAgentProvider;
   providerSessionId: string | null;
   finalResponse: string;
   items: unknown[];
