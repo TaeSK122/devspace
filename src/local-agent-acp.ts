@@ -278,7 +278,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
       const app = client({ name: "DevSpace" })
         .onRequest(methods.client.session.requestPermission, (context) => {
           const writeMode = queuesWriteMode(context.params.sessionId, sessionWriteModes);
-          const selected = selectAcpPermissionOption(context.params.options, writeMode);
+          const selected = selectAcpPermissionOption(context.params.options, writeMode, this.provider);
           return selected
             ? { outcome: { outcome: "selected", optionId: selected.optionId } }
             : { outcome: { outcome: "cancelled" } };
@@ -491,7 +491,15 @@ export function selectAcpAllowPermissionOption(
 export function selectAcpPermissionOption(
   options: Array<{ optionId: string; kind: string }>,
   writeMode: LocalAgentWriteMode | undefined,
+  provider?: AcpProvider,
 ): { optionId: string } | undefined {
+  // Copilot's native sandbox has a per-command escape hatch enabled by
+  // default. Normal turns already pass --allow-all-tools, so any permission
+  // request that reaches ACP is an attempted escalation (including a
+  // sandbox bypass). Cancel it instead of turning an ACP approval into host
+  // authority. Full access deliberately keeps the provider's unrestricted
+  // behavior.
+  if (provider === "copilot" && writeMode !== "full_access") return undefined;
   const selected = writeMode === "read_only"
     ? options.find((option) => option.kind === "reject_once")
       ?? options.find((option) => option.kind === "reject_always")

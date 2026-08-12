@@ -127,6 +127,21 @@ assert.deepEqual(
   ], "read_only"),
   { optionId: "reject" },
 );
+assert.equal(
+  selectAcpPermissionOption([
+    { optionId: "allow", kind: "allow_once" },
+    { optionId: "reject", kind: "reject_once" },
+  ], "allowed", "copilot"),
+  undefined,
+  "sandboxed Copilot permission requests must fail closed",
+);
+assert.deepEqual(
+  selectAcpPermissionOption([
+    { optionId: "allow", kind: "allow_once" },
+    { optionId: "reject", kind: "reject_once" },
+  ], "full_access", "copilot"),
+  { optionId: "allow" },
+);
 
 let resolverCalls = 0;
 const cachedDriver = new AcpLocalAgentDriver("cursor", {}, () => {
