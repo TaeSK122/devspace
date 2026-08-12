@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
   OpencodeLocalAgentDriver,
+  opencodeAgentFor,
+  opencodePermissionFor,
   type OpencodeClientLike,
   type OpencodeFactory,
 } from "./local-agent-opencode.js";
@@ -10,6 +12,8 @@ let sessionNumber = 0;
 const createInputs: unknown[] = [];
 const promptInputs: unknown[] = [];
 const switchInputs: unknown[] = [];
+const agentInputs: unknown[] = [];
+let healthAvailable = true;
 const client = {
   v2: {
     session: {
@@ -35,8 +39,13 @@ const client = {
     async get() {
       return { data: { data: { model: { providerID: "anthropic", id: "sonnet" } } } };
     },
+    async switchAgent(input: unknown) { agentInputs.push(input); },
     async switchModel(input: unknown) { switchInputs.push(input); },
     },
+    health: { async get() {
+      if (!healthAvailable) throw new Error("server unavailable");
+      return { data: { healthy: true } };
+    } },
   },
 } as unknown as OpencodeClientLike;
 let factoryCalls = 0;
@@ -76,6 +85,7 @@ assert.equal(second.providerSessionId, "session_2");
 assert.equal(second.finalResponse, "response:session_2");
 assert.deepEqual(createInputs[0], {
   location: { directory: "/tmp/project" },
+  agent: "devspace_allowed",
   model: { providerID: "anthropic", id: "sonnet", variant: "high" },
 });
 assert.deepEqual(promptInputs[0], {
@@ -101,6 +111,59 @@ assert.deepEqual(switchInputs[0], {
   sessionID: "session_1",
   model: { providerID: "anthropic", id: "sonnet", variant: "low" },
 });
+assert.deepEqual(agentInputs[0], { sessionID: "session_1", agent: "devspace_allowed" });
+assert.equal(opencodeAgentFor("read_only"), "devspace_read_only");
+assert.equal(opencodeAgentFor("full_access"), "devspace_full_access");
+assert.deepEqual(opencodePermissionFor("allowed"), {
+  read: "allow",
+  edit: "allow",
+  glob: "allow",
+  grep: "allow",
+  list: "allow",
+  bash: "allow",
+  external_directory: "deny",
+});
+const readOnlyPermissions = opencodePermissionFor("read_only");
+assert.equal(typeof readOnlyPermissions === "object" ? readOnlyPermissions.bash : undefined, "deny");
+
+let recoveringFactoryCalls = 0;
+const recoveringDriver = new OpencodeLocalAgentDriver(async () => {
+  recoveringFactoryCalls += 1;
+  healthAvailable = true;
+  return { client, server: { close: () => undefined } };
+});
+const recoveringPool = new LocalAgentRuntimePool();
+await recoveringPool.run(recoveringDriver, {
+  agentId: "agt_dead",
+  provider: "opencode",
+  workspace: "/tmp/project",
+}, {
+  prompt: "initial",
+  workspace: "/tmp/project",
+});
+healthAvailable = false;
+await assert.rejects(
+  recoveringPool.run(recoveringDriver, {
+    agentId: "agt_dead",
+    provider: "opencode",
+    workspace: "/tmp/project",
+  }, {
+    prompt: "dead runtime",
+    workspace: "/tmp/project",
+  }),
+  /health check failed/,
+);
+assert.equal(recoveringPool.size, 0, "a failed health check removes the dead runtime immediately");
+await recoveringPool.run(recoveringDriver, {
+  agentId: "agt_dead",
+  provider: "opencode",
+  workspace: "/tmp/project",
+}, {
+  prompt: "recreated",
+  workspace: "/tmp/project",
+});
+assert.equal(recoveringFactoryCalls, 2, "the next turn creates a fresh OpenCode server");
+await recoveringPool.close();
 
 await pool.close();
 await pool.close();

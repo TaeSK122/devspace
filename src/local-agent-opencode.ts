@@ -2,6 +2,7 @@ import type {
   ModelRef,
   OpencodeClient,
   PromptInput,
+  PermissionConfig,
   SessionMessagesResponse,
   SessionV2Info,
 } from "@opencode-ai/sdk/v2";
@@ -20,7 +21,7 @@ export interface OpencodeServerLike {
   close(): void;
 }
 
-export type OpencodeFactory = () => Promise<{
+export type OpencodeFactory = (context?: LocalAgentRuntimeContext) => Promise<{
   client: OpencodeClientLike;
   server: OpencodeServerLike;
 }>;
@@ -37,27 +38,37 @@ export class OpencodeRuntime implements LocalAgentRuntime {
 
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.alive) throw new Error("OpenCode runtime is not running.");
-    const resumed = Boolean(input.providerSessionId);
-    const initialModel = input.model ? parseOpencodeModel(input.model, input.thinking) : undefined;
-    const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, initialModel);
-    await callbacks?.onSessionId?.(sessionId);
+    try {
+      await assertOpencodeHealthy(this.client);
+      const resumed = Boolean(input.providerSessionId);
+      const initialModel = input.model ? parseOpencodeModel(input.model, input.thinking) : undefined;
+      const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, initialModel);
+      await callbacks?.onSessionId?.(sessionId);
+      await this.client.v2.session.switchAgent({
+        sessionID: sessionId,
+        agent: opencodeAgentFor(input.writeMode),
+      }, { throwOnError: true });
 
-    const model = initialModel ?? (input.thinking ? await modelWithThinking(this.client, sessionId, input.thinking) : undefined);
-    if (model && (resumed || !initialModel)) {
-      await this.client.v2.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
+      const model = initialModel ?? (input.thinking ? await modelWithThinking(this.client, sessionId, input.thinking) : undefined);
+      if (model && (resumed || !initialModel)) {
+        await this.client.v2.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
+      }
+      const promptResult = await promptOpencodeSession(this.client, sessionId, input);
+      await waitForOpencodeSession(this.client, sessionId);
+      const messages = await readOpencodeMessages(this.client, sessionId);
+      const finalResponse = requireFinalResponse(
+        extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+      );
+      return {
+        provider: this.provider,
+        providerSessionId: sessionId,
+        finalResponse,
+        items: [promptResult, messages],
+      };
+    } catch (error) {
+      if (isOpenCodeTransportFailure(error)) this.alive = false;
+      throw error;
     }
-    const promptResult = await promptOpencodeSession(this.client, sessionId, input);
-    await waitForOpencodeSession(this.client, sessionId);
-    const messages = await readOpencodeMessages(this.client, sessionId);
-    const finalResponse = requireFinalResponse(
-      extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
-    );
-    return {
-      provider: this.provider,
-      providerSessionId: sessionId,
-      finalResponse,
-      items: [promptResult, messages],
-    };
   }
 
   async releaseSession(_providerSessionId: string): Promise<void> {
@@ -87,14 +98,20 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
   }
 
   async createRuntime(_context: LocalAgentRuntimeContext): Promise<LocalAgentRuntime> {
-    const { client, server } = await this.factory();
+    const { client, server } = await this.factory(_context);
     return new OpencodeRuntime(client, server);
   }
 }
 
 async function defaultOpencodeFactory(): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
   const { createOpencode } = await import("@opencode-ai/sdk/v2");
-  return createOpencode();
+  return createOpencode({ config: {
+    agent: {
+      devspace_read_only: { permission: opencodePermissionFor("read_only") },
+      devspace_allowed: { permission: opencodePermissionFor("allowed") },
+      devspace_full_access: { permission: opencodePermissionFor("full_access") },
+    },
+  } });
 }
 
 async function createOpencodeSession(
@@ -104,9 +121,57 @@ async function createOpencodeSession(
 ): Promise<string> {
   const result = await client.v2.session.create({
     location: { directory: input.workspace },
+    agent: opencodeAgentFor(input.writeMode),
     ...(model ? { model } : {}),
   }, { throwOnError: true });
   return requireSessionId(result.data.data);
+}
+
+export function opencodeAgentFor(writeMode: LocalAgentRunInput["writeMode"]): string {
+  switch (writeMode) {
+    case "read_only": return "devspace_read_only";
+    case "full_access": return "devspace_full_access";
+    case "allowed":
+    case undefined: return "devspace_allowed";
+  }
+}
+
+export function opencodePermissionFor(writeMode: LocalAgentRunInput["writeMode"]): PermissionConfig {
+  const allowed = writeMode !== "read_only";
+  const unrestricted = writeMode === "full_access";
+  return {
+    read: "allow",
+    edit: allowed ? "allow" : "deny",
+    glob: "allow",
+    grep: "allow",
+    list: "allow",
+    bash: allowed ? "allow" : "deny",
+    external_directory: unrestricted ? "allow" : "deny",
+  };
+}
+
+async function assertOpencodeHealthy(client: OpencodeClientLike): Promise<void> {
+  const health = client.v2.health;
+  if (!health) return;
+  try {
+    await health.get({ throwOnError: true });
+  } catch (error) {
+    throw new OpencodeHealthError(errorMessage(error));
+  }
+}
+
+function isOpenCodeTransportFailure(error: unknown): boolean {
+  if (error instanceof OpencodeHealthError) return true;
+  if (!(error instanceof Error)) return true;
+  const message = error.message.toLowerCase();
+  return message.includes("fetch") || message.includes("econn") || message.includes("socket") || message.includes("health") || message.includes("network") || message.includes("server");
+}
+
+class OpencodeHealthError extends Error {
+  constructor(message: string) {
+    super(`OpenCode server health check failed: ${message}`);
+    this.name = "OpencodeHealthError";
+  }
 }
 
 async function modelWithThinking(
@@ -242,4 +307,8 @@ function requireFinalResponse(response: string): string {
   const trimmed = response.trim();
   if (!trimmed) throw new Error("OpenCode did not return a final assistant response.");
   return trimmed;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
