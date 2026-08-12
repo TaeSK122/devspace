@@ -34,7 +34,7 @@ DevSpace agent id.
 `run <provider> "<prompt>"` starts a raw built-in provider when no configured
 profile is needed. Built-in providers are listed by `open_workspace`.
 
-`run <id> "<prompt>"` sends a follow-up to an existing agent.
+`continue <id> "<prompt>"` sends a follow-up to an existing agent.
 
 `show <id>` prints status and the latest response. If the agent is still
 running, `show` waits briefly. If there is still no final response, call `show`

@@ -183,7 +183,7 @@ sessions, while Claude and Pi keep one warm runtime per DevSpace agent. There is
 one active turn per agent; different agents may run concurrently.
 
 If the daemon restarts during a turn, persisted `starting` and `running` agents
-become `error` with a restart message. The next `agents run <id>` request can
+become `error` with a restart message. The next `agents continue <id>` request can
 continue the provider session when that provider supports resumption. The MCP
 server can restart independently because it does not own this state.
 
