@@ -11,9 +11,9 @@ import type {
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_test",
   provider: "codex",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
 };
-const input: LocalAgentRunInput = { prompt: "inspect", workspace: "/tmp/project" };
+const input: LocalAgentRunInput = { prompt: "inspect", workspaceRoot: "/tmp/project" };
 
 class FakeRuntime implements LocalAgentRuntime {
   readonly provider = "codex" as const;

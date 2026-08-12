@@ -162,7 +162,7 @@ export class AcpRuntime implements LocalAgentRuntime {
       }
       const response = await this.connection.agent.request("session/resume", {
         sessionId: input.providerSessionId,
-        cwd: input.workspace,
+        cwd: input.workspaceRoot,
         mcpServers: [],
         ...this.additionalDirectoryParams(),
       });
@@ -176,7 +176,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     }
 
     const response = await this.connection.agent.request("session/new", {
-      cwd: input.workspace,
+      cwd: input.workspaceRoot,
       mcpServers: [],
       ...this.additionalDirectoryParams(),
     });
@@ -245,7 +245,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
   runtimeKey(context: LocalAgentRuntimeContext): string {
     const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
     const writeMode = context.writeMode ?? "allowed";
-    const workspace = writeMode === "full_access" ? "shared" : resolve(context.workspace);
+    const workspace = writeMode === "full_access" ? "shared" : resolve(context.workspaceRoot);
     return `acp:${this.provider}:${command}:${writeMode}:${workspace}`;
   }
 
@@ -254,7 +254,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     if (!command) throw new Error(`${this.provider} provider is not available: executable not found.`);
     const args = acpCommandArgs(this.provider, context);
     const child = spawn(command, args, {
-      cwd: resolve(context.workspace),
+      cwd: resolve(context.workspaceRoot),
       env: this.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
@@ -386,7 +386,7 @@ export function acpCommandArgs(provider: AcpProvider, context: LocalAgentRuntime
     return [
       "acp",
       "--sandbox", writeMode === "full_access" ? "disabled" : "enabled",
-      "--workspace", resolve(context.workspace),
+      "--workspace", resolve(context.workspaceRoot),
       ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
       ...(writeMode === "full_access" ? ["--force"] : []),
     ];
@@ -399,8 +399,8 @@ export function acpCommandArgs(provider: AcpProvider, context: LocalAgentRuntime
     ...sandboxArgs,
     ...(writeMode === "full_access"
       ? ["--allow-all"]
-      : ["--allow-all-tools", "--add-dir", resolve(context.workspace)]),
-    "-C", resolve(context.workspace),
+      : ["--allow-all-tools", "--add-dir", resolve(context.workspaceRoot)]),
+    "-C", resolve(context.workspaceRoot),
     ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
   ];
 }

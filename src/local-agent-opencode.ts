@@ -120,7 +120,7 @@ async function createOpencodeSession(
   model?: ModelRef,
 ): Promise<string> {
   const result = await client.v2.session.create({
-    location: { directory: input.workspace },
+    location: { directory: input.workspaceRoot },
     agent: opencodeAgentFor(input.writeMode),
     ...(model ? { model } : {}),
   }, { throwOnError: true });

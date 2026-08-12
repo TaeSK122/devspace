@@ -384,7 +384,7 @@ class CodexAppServerRpc {
 function threadParams(input: LocalAgentRunInput): Record<string, unknown> {
   return {
     ...(input.providerSessionId ? { threadId: input.providerSessionId } : {}),
-    cwd: input.workspace,
+    cwd: input.workspaceRoot,
     approvalPolicy: "never",
     sandbox: sandboxFor(input.writeMode),
     ...(input.model ? { model: input.model } : {}),

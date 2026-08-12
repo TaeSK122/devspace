@@ -55,7 +55,7 @@ class FakeClaudeQuery implements ClaudeQueryLike, AsyncIterator<unknown> {
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_claude",
   provider: "claude",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   model: "sonnet",
   thinking: "high",
   writeMode: "read_only",
@@ -74,7 +74,7 @@ const runtime = await driver.createRuntime(context);
 const sessionIds: string[] = [];
 const first = await runtime.run({
   prompt: "first",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   model: "sonnet",
   thinking: "high",
   writeMode: "read_only",
@@ -83,13 +83,13 @@ const first = await runtime.run({
 });
 const second = await runtime.run({
   prompt: "second",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   thinking: "low",
   writeMode: "allowed",
 });
 await runtime.run({
   prompt: "third",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   thinking: "high",
   writeMode: "full_access",
 });

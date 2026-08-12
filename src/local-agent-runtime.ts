@@ -4,7 +4,7 @@ export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
 export interface LocalAgentRunInput {
   prompt: string;
-  workspace: string;
+  workspaceRoot: string;
   providerSessionId?: string;
   writeMode?: LocalAgentWriteMode;
   model?: string;
@@ -30,7 +30,7 @@ export interface LocalAgentRunCallbacks {
 export interface LocalAgentRuntimeContext {
   agentId: string;
   provider: LocalAgentProvider;
-  workspace: string;
+  workspaceRoot: string;
   providerSessionId?: string;
   writeMode?: LocalAgentWriteMode;
   model?: string;

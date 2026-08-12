@@ -66,13 +66,13 @@ const pool = new LocalAgentRuntimePool();
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_pi",
   provider: "pi",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
 };
 const sessionIds: string[] = [];
 
 const first = await pool.run(driver, context, {
   prompt: "first",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   model: "provider/model",
   thinking: "high",
   writeMode: "read_only",
@@ -81,17 +81,17 @@ const first = await pool.run(driver, context, {
 });
 const second = await pool.run(driver, context, {
   prompt: "second",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   writeMode: "allowed",
 });
 await pool.run(driver, context, {
   prompt: "third",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   writeMode: "full_access",
 });
 await pool.run(driver, context, {
   prompt: "fourth",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   writeMode: "read_only",
 });
 assert.equal(contexts.length, 1, "one warm Pi session serves successive turns");
@@ -112,7 +112,7 @@ assert.deepEqual(sessions[0]?.toolHistory, [
 
 await pool.run(driver, { ...context, providerSessionId: "pi_session_1" }, {
   prompt: "fifth",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   providerSessionId: "pi_session_1",
   writeMode: "allowed",
 });
@@ -123,7 +123,7 @@ assert.equal(sessions[0]?.disposeCount, 1, "idle eviction disposes the in-proces
 
 await pool.run(driver, { ...context, providerSessionId: "pi_session_1" }, {
   prompt: "resumed",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   providerSessionId: "pi_session_1",
 });
 assert.equal(contexts.length, 2, "cold continuation creates a new AgentSession");

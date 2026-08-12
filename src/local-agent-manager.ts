@@ -217,7 +217,7 @@ export class LocalAgentManager {
       const context: LocalAgentRuntimeContext = {
         agentId: record.id,
         provider: driver.provider,
-        workspace: record.workspaceRoot,
+        workspaceRoot: record.workspaceRoot,
         providerSessionId: record.providerSessionId,
         writeMode: input.writeMode,
         model: input.model,
@@ -281,7 +281,7 @@ export class LocalAgentManager {
     const fullPrompt = body ? `${body}\n\nTask:\n${prompt}` : prompt;
     return {
       prompt: fullPrompt,
-      workspace: record.workspaceRoot,
+      workspaceRoot: record.workspaceRoot,
       providerSessionId: record.providerSessionId,
       writeMode: overrides.writeMode ?? "allowed",
       model: record.model ?? profile?.model,

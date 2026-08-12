@@ -83,7 +83,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.isAlive()) throw new Error("Claude runtime is not running.");
     if (this.providerSessionId) await callbacks?.onSessionId?.(this.providerSessionId);
-    const flagSettings = claudeAuthoritySettings(input.workspace, input.writeMode);
+    const flagSettings = claudeAuthoritySettings(input.workspaceRoot, input.writeMode);
     if (input.thinking) {
       Object.assign(flagSettings, {
         alwaysThinkingEnabled: true,
@@ -171,7 +171,7 @@ export class ClaudeLocalAgentDriver implements LocalAgentDriver {
     const inputQueue = new AsyncInputQueue<ClaudeUserMessage>();
     const input: LocalAgentRunInput = {
       prompt: "",
-      workspace: context.workspace,
+      workspaceRoot: context.workspaceRoot,
       providerSessionId: context.providerSessionId,
       writeMode: context.writeMode,
       model: context.model,
@@ -204,9 +204,9 @@ export function claudeQueryOptions(
 ): Record<string, unknown> {
   const executable = env.CLAUDE_COMMAND ?? resolveExecutable("claude", env);
   const permissionMode = claudePermissionMode(input.writeMode);
-  const authority = claudeAuthorityOptions(input.workspace, input.writeMode);
+  const authority = claudeAuthorityOptions(input.workspaceRoot, input.writeMode);
   return {
-    cwd: input.workspace,
+    cwd: input.workspaceRoot,
     ...(input.model ? { model: input.model } : {}),
     ...(input.thinking ? { thinking: { type: "adaptive" }, effort: input.thinking } : {}),
     ...(context.providerSessionId ? { resume: context.providerSessionId } : {}),
@@ -232,14 +232,14 @@ export function claudePermissionMode(
 }
 
 export function claudeAuthoritySettings(
-  workspace: string,
+  workspaceRoot: string,
   writeMode: LocalAgentWriteMode | undefined,
 ): Record<string, unknown> {
-  return claudeAuthorityOptions(workspace, writeMode).settings;
+  return claudeAuthorityOptions(workspaceRoot, writeMode).settings;
 }
 
 function claudeAuthorityOptions(
-  workspace: string,
+  workspaceRoot: string,
   writeMode: LocalAgentWriteMode | undefined,
 ): { sandbox: Record<string, unknown>; settings: Record<string, unknown> } {
   if (writeMode === "full_access") {
@@ -256,7 +256,7 @@ function claudeAuthorityOptions(
     };
   }
 
-  const resolvedWorkspace = workspace.replaceAll("\\", "/");
+  const resolvedWorkspace = workspaceRoot.replaceAll("\\", "/");
   const workspaceRules = [
     `Read(${resolvedWorkspace}/**)`,
     `Glob(${resolvedWorkspace}/**)`,
@@ -282,10 +282,10 @@ function claudeAuthorityOptions(
     autoAllowBashIfSandboxed: true,
     allowUnsandboxedCommands: false,
     filesystem: {
-      allowWrite: allowed ? [workspace] : [],
-      denyWrite: allowed ? [] : [workspace],
+      allowWrite: allowed ? [workspaceRoot] : [],
+      denyWrite: allowed ? [] : [workspaceRoot],
       denyRead: protectedPaths,
-      allowRead: [workspace],
+      allowRead: [workspaceRoot],
     },
   };
   return { sandbox, settings: { permissions, sandbox } };

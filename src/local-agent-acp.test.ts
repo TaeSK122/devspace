@@ -58,7 +58,7 @@ const runtime = new AcpRuntime({
 
 const first = await runtime.run({
   prompt: "first",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   model: "model-a",
   thinking: "high",
   writeMode: "read_only",
@@ -67,7 +67,7 @@ const first = await runtime.run({
 });
 const warm = await runtime.run({
   prompt: "warm",
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   providerSessionId: first.providerSessionId ?? undefined,
   model: "model-a",
   thinking: "high",
@@ -100,7 +100,7 @@ const resumedRuntime = new AcpRuntime({
 await assert.rejects(
   resumedRuntime.run({
     prompt: "resumed",
-    workspace: "/tmp/project",
+    workspaceRoot: "/tmp/project",
     providerSessionId: first.providerSessionId ?? undefined,
     model: "model-that-is-not-advertised-after-resume",
   }),
@@ -151,7 +151,7 @@ const cachedDriver = new AcpLocalAgentDriver("cursor", {}, () => {
 const cachedContext = {
   agentId: "agt_acp",
   provider: "cursor" as const,
-  workspace: "/tmp/project",
+  workspaceRoot: "/tmp/project",
   writeMode: "allowed" as const,
 };
 assert.equal(cachedDriver.runtimeKey(cachedContext), "acp:cursor:/usr/local/bin/cursor-agent:allowed:/tmp/project");
