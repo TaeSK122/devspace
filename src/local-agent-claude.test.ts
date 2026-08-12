@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   ClaudeLocalAgentDriver,
+  claudeAuthoritySettings,
   type ClaudeQueryLike,
   type ClaudeUserMessage,
 } from "./local-agent-claude.js";
@@ -97,15 +98,55 @@ assert.equal(first.providerSessionId, "claude_session_1");
 assert.equal(second.finalResponse, "response:second");
 assert.equal(query?.model, "sonnet");
 assert.equal(lastOptions?.resume, undefined);
-assert.equal(lastOptions?.permissionMode, "plan");
-assert.equal(lastOptions?.allowDangerouslySkipPermissions, true);
+assert.equal(lastOptions?.permissionMode, "dontAsk");
+assert.equal(lastOptions?.allowDangerouslySkipPermissions, undefined);
+const initialSandbox = lastOptions?.sandbox as Record<string, unknown>;
+assert.equal(initialSandbox.enabled, true);
+assert.equal(initialSandbox.failIfUnavailable, true);
+assert.equal(initialSandbox.autoAllowBashIfSandboxed, true);
+assert.equal(initialSandbox.allowUnsandboxedCommands, false);
+assert.deepEqual((initialSandbox.filesystem as Record<string, unknown>).allowWrite, []);
+assert.deepEqual((initialSandbox.filesystem as Record<string, unknown>).denyWrite, ["/tmp/project"]);
+const allowedSettings = claudeAuthoritySettings("/tmp/project", "allowed");
+const allowedPermissions = allowedSettings.permissions as Record<string, unknown>;
+const allowedSandbox = allowedSettings.sandbox as Record<string, unknown>;
+assert.ok((allowedPermissions.allow as string[]).includes("Bash(*)"));
+assert.deepEqual(allowedSandbox.filesystem, {
+  allowWrite: ["/tmp/project"],
+  denyWrite: [],
+  denyRead: (allowedSandbox.filesystem as Record<string, unknown>).denyRead,
+  allowRead: ["/tmp/project"],
+});
+const readOnlySettings = claudeAuthoritySettings("/tmp/project", "read_only");
+const readOnlyPermissions = readOnlySettings.permissions as Record<string, unknown>;
+assert.equal((readOnlyPermissions.allow as string[]).some((rule) => rule.startsWith("Edit(")), false);
+assert.ok((readOnlyPermissions.deny as string[]).includes("Bash(*)"));
+assert.deepEqual(
+  ((readOnlySettings.sandbox as Record<string, unknown>).filesystem as Record<string, unknown>).allowWrite,
+  [],
+);
+const fullSettings = claudeAuthoritySettings("/tmp/project", "full_access");
+assert.deepEqual((fullSettings.sandbox as Record<string, unknown>), {
+  enabled: false,
+  allowUnsandboxedCommands: true,
+});
 assert.deepEqual(sessionIds, ["claude_session_1"]);
-assert.deepEqual(query?.permissionModes, ["plan", "acceptEdits", "bypassPermissions"]);
-assert.deepEqual(query?.flagSettings, [
-  { alwaysThinkingEnabled: true, effortLevel: "high" },
-  { alwaysThinkingEnabled: true, effortLevel: "low" },
-  { alwaysThinkingEnabled: true, effortLevel: "high" },
-]);
+assert.deepEqual(query?.permissionModes, ["dontAsk", "dontAsk", "bypassPermissions"]);
+assert.equal(query?.flagSettings.length, 3);
+assert.equal(query?.flagSettings[0]?.alwaysThinkingEnabled, true);
+assert.equal(query?.flagSettings[0]?.effortLevel, "high");
+assert.equal(
+  (query?.flagSettings[0]?.permissions as Record<string, unknown>).defaultMode,
+  "dontAsk",
+);
+assert.equal(query?.flagSettings[1]?.effortLevel, "low");
+assert.ok(
+  ((query?.flagSettings[1]?.permissions as Record<string, unknown>).allow as string[]).includes("Bash(*)"),
+);
+assert.equal(
+  (query?.flagSettings[2]?.permissions as Record<string, unknown>).defaultMode,
+  "bypassPermissions",
+);
 
 await runtime.close();
 await runtime.close();

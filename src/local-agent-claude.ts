@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import type {
   LocalAgentDriver,
@@ -81,13 +83,15 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     if (!this.isAlive()) throw new Error("Claude runtime is not running.");
     if (this.providerSessionId) await callbacks?.onSessionId?.(this.providerSessionId);
-    await this.query.setPermissionMode(claudePermissionMode(input.writeMode));
+    const flagSettings = claudeAuthoritySettings(input.workspace, input.writeMode);
     if (input.thinking) {
-      await this.query.applyFlagSettings({
+      Object.assign(flagSettings, {
         alwaysThinkingEnabled: true,
         effortLevel: input.thinking,
       });
     }
+    await this.query.applyFlagSettings(flagSettings);
+    await this.query.setPermissionMode(claudePermissionMode(input.writeMode));
     if (input.model && this.query.setModel) await this.query.setModel(input.model);
     this.inputQueue.push({
       type: "user",
@@ -200,15 +204,16 @@ export function claudeQueryOptions(
 ): Record<string, unknown> {
   const executable = env.CLAUDE_COMMAND ?? resolveExecutable("claude", env);
   const permissionMode = claudePermissionMode(input.writeMode);
+  const authority = claudeAuthorityOptions(input.workspace, input.writeMode);
   return {
     cwd: input.workspace,
     ...(input.model ? { model: input.model } : {}),
     ...(input.thinking ? { thinking: { type: "adaptive" }, effort: input.thinking } : {}),
     ...(context.providerSessionId ? { resume: context.providerSessionId } : {}),
     permissionMode,
-    // This flag only permits a later explicit switch to bypassPermissions; the
-    // active permissionMode remains the authority for each turn.
-    allowDangerouslySkipPermissions: true,
+    sandbox: authority.sandbox,
+    settings: authority.settings,
+    ...(input.writeMode === "full_access" ? { allowDangerouslySkipPermissions: true } : {}),
     env: claudeCommandEnvironment(env),
     ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
   };
@@ -218,12 +223,84 @@ export function claudePermissionMode(
   writeMode: LocalAgentWriteMode | undefined,
 ): ClaudePermissionMode {
   switch (writeMode) {
-    case "read_only": return "plan";
-    case "full_access": return "bypassPermissions";
+    case "read_only":
     case "allowed":
     case undefined:
-      return "acceptEdits";
+      return "dontAsk";
+    case "full_access": return "bypassPermissions";
   }
+}
+
+export function claudeAuthoritySettings(
+  workspace: string,
+  writeMode: LocalAgentWriteMode | undefined,
+): Record<string, unknown> {
+  return claudeAuthorityOptions(workspace, writeMode).settings;
+}
+
+function claudeAuthorityOptions(
+  workspace: string,
+  writeMode: LocalAgentWriteMode | undefined,
+): { sandbox: Record<string, unknown>; settings: Record<string, unknown> } {
+  if (writeMode === "full_access") {
+    const sandbox = {
+      enabled: false,
+      allowUnsandboxedCommands: true,
+    };
+    return {
+      sandbox,
+      settings: {
+        permissions: { defaultMode: "bypassPermissions" },
+        sandbox,
+      },
+    };
+  }
+
+  const resolvedWorkspace = workspace.replaceAll("\\", "/");
+  const workspaceRules = [
+    `Read(${resolvedWorkspace}/**)`,
+    `Glob(${resolvedWorkspace}/**)`,
+    `Grep(${resolvedWorkspace}/**)`,
+    `LS(${resolvedWorkspace}/**)`,
+  ];
+  const allowed = writeMode !== "read_only";
+  const protectedPaths = claudeProtectedPaths();
+  const permissions = {
+    defaultMode: "dontAsk",
+    allow: [
+      ...workspaceRules,
+      ...(allowed ? [`Edit(${resolvedWorkspace}/**)`, "Bash(*)"] : []),
+    ],
+    deny: [
+      ...protectedPaths.map((path) => `Read(${path.replaceAll("\\", "/")}/**)`),
+      ...(allowed ? [] : ["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"]),
+    ],
+  };
+  const sandbox = {
+    enabled: true,
+    failIfUnavailable: true,
+    autoAllowBashIfSandboxed: true,
+    allowUnsandboxedCommands: false,
+    filesystem: {
+      allowWrite: allowed ? [workspace] : [],
+      denyWrite: allowed ? [] : [workspace],
+      denyRead: protectedPaths,
+      allowRead: [workspace],
+    },
+  };
+  return { sandbox, settings: { permissions, sandbox } };
+}
+
+function claudeProtectedPaths(): string[] {
+  const home = homedir();
+  return [
+    join(home, ".ssh"),
+    join(home, ".aws"),
+    join(home, ".gnupg"),
+    join(home, ".config", "gcloud"),
+    join(home, ".netrc"),
+    join(home, ".npmrc"),
+  ];
 }
 
 export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
