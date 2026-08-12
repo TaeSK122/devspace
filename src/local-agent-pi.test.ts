@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import {
   PiLocalAgentDriver,
+  piToolsForWriteMode,
   type PiSessionFactory,
   type PiSessionLike,
 } from "./local-agent-pi.js";
+import { createPiSandboxConfig } from "./local-agent-pi-sandbox.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import type { LocalAgentRuntimeContext } from "./local-agent-runtime.js";
 
@@ -97,10 +99,12 @@ assert.equal(second.finalResponse, "response:second");
 assert.deepEqual(sessions[0]?.model, { id: "model" });
 assert.equal(sessions[0]?.thinking, "high");
 assert.deepEqual(sessionIds, ["pi_session_1"]);
+assert.deepEqual(piToolsForWriteMode("allowed"), ["read", "grep", "find", "ls", "edit", "write", "bash"]);
+assert.ok(createPiSandboxConfig().filesystem.denyRead.some((path) => path.endsWith("/.ssh")));
 assert.deepEqual(sessions[0]?.activeTools, ["read", "grep", "find", "ls"]);
 assert.deepEqual(sessions[0]?.toolHistory, [
   ["read", "grep", "find", "ls"],
-  ["read", "grep", "find", "ls", "edit", "write"],
+  ["read", "grep", "find", "ls", "edit", "write", "bash"],
   ["read", "grep", "find", "ls", "edit", "write", "bash"],
   ["read", "grep", "find", "ls"],
 ]);
@@ -111,7 +115,7 @@ await pool.run(driver, { ...context, providerSessionId: "pi_session_1" }, {
   providerSessionId: "pi_session_1",
   writeMode: "allowed",
 });
-assert.deepEqual(sessions[0]?.activeTools, ["read", "grep", "find", "ls", "edit", "write"]);
+assert.deepEqual(sessions[0]?.activeTools, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
 
 await pool.evictIdle(Date.now() + 10 * 60_000);
 assert.equal(sessions[0]?.disposeCount, 1, "idle eviction disposes the in-process session");
@@ -123,5 +127,5 @@ await pool.run(driver, { ...context, providerSessionId: "pi_session_1" }, {
 });
 assert.equal(contexts.length, 2, "cold continuation creates a new AgentSession");
 assert.equal(contexts[1]?.providerSessionId, "pi_session_1");
-assert.deepEqual(sessions[1]?.activeTools, ["read", "grep", "find", "ls", "edit", "write"]);
+assert.deepEqual(sessions[1]?.activeTools, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
 await pool.close();
