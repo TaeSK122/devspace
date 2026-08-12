@@ -7,10 +7,17 @@ import type {
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
+import {
+  createPiSandboxExtension,
+  createPiSandboxModeRef,
+  registerPiSandboxSession,
+  releasePiSandboxSession,
+  updatePiSandboxSession,
+} from "./local-agent-pi-sandbox.js";
 
 const PI_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
-const PI_WORKSPACE_TOOLS = ["read", "grep", "find", "ls", "edit", "write"] as const;
-const PI_FULL_ACCESS_TOOLS = [...PI_WORKSPACE_TOOLS, "bash"] as const;
+const PI_WORKSPACE_TOOLS = ["read", "grep", "find", "ls", "edit", "write", "bash"] as const;
+const PI_FULL_ACCESS_TOOLS = [...PI_WORKSPACE_TOOLS] as const;
 const MAX_PI_EVENTS = 10_000;
 
 export interface PiSessionLike {
@@ -87,10 +94,15 @@ export class PiSessionRuntime implements LocalAgentRuntime {
     this.closed = true;
     this.alive = false;
     this.unsubscribe();
-    this.session.dispose();
+    try {
+      await releasePiSandboxSession(this.session);
+    } finally {
+      this.session.dispose();
+    }
   }
 
   private async applyOverrides(input: LocalAgentRunInput): Promise<void> {
+    await updatePiSandboxSession(this.session, input.workspace, input.writeMode ?? "allowed");
     this.session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
     if (input.model && this.session.modelRegistry && this.session.setModel) {
       const model = resolvePiModel(this.session.modelRegistry, input.model);
@@ -135,6 +147,7 @@ async function defaultPiSessionFactory(
     AuthStorage,
     ModelRegistry,
     SessionManager,
+    DefaultResourceLoader,
     createAgentSession,
     getAgentDir,
   } = await import("@earendil-works/pi-coding-agent");
@@ -146,30 +159,49 @@ async function defaultPiSessionFactory(
   const sessionManager = await resolveSessionManager(SessionManager, input.workspace, input.providerSessionId);
   const model = input.model ? resolvePiModel(modelRegistry, input.model) : undefined;
   if (input.model && !model) throw new Error(`Pi model not found: ${input.model}`);
-  const result = await createAgentSession({
+  const modeRef = createPiSandboxModeRef(input.writeMode ?? "allowed");
+  const resourceLoader = new DefaultResourceLoader({
     cwd: input.workspace,
     agentDir,
-    authStorage,
-    modelRegistry,
-    sessionManager: sessionManager as never,
-    ...(model ? { model: model as never } : {}),
-    ...(input.thinking ? { thinkingLevel: input.thinking as never } : {}),
-    // Keep the full built-in registry available so warm turns can narrow or
-    // broaden active tools without recreating the session.
-    tools: [...PI_FULL_ACCESS_TOOLS],
+    extensionFactories: [createPiSandboxExtension(input.workspace, modeRef)],
   });
-  const session = result.session as unknown as PiSessionLike;
-  session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
-  return session;
+  let session: PiSessionLike | undefined;
+  try {
+    const result = await createAgentSession({
+      cwd: input.workspace,
+      agentDir,
+      authStorage,
+      modelRegistry,
+      sessionManager: sessionManager as never,
+      resourceLoader,
+      ...(model ? { model: model as never } : {}),
+      ...(input.thinking ? { thinkingLevel: input.thinking as never } : {}),
+      // Keep the full built-in registry available so warm turns can narrow or
+      // broaden active tools without recreating the session.
+      tools: [...PI_FULL_ACCESS_TOOLS],
+    });
+    session = result.session as unknown as PiSessionLike;
+    await registerPiSandboxSession(session, input.workspace, modeRef, input.writeMode ?? "allowed");
+    session.setActiveToolsByName([...piToolsForWriteMode(input.writeMode)]);
+    return session;
+  } catch (error) {
+    if (session) {
+      try {
+        await releasePiSandboxSession(session);
+      } finally {
+        session.dispose();
+      }
+    }
+    throw error;
+  }
 }
 
-function piToolsForWriteMode(writeMode: LocalAgentRunInput["writeMode"]): readonly string[] {
+export function piToolsForWriteMode(writeMode: LocalAgentRunInput["writeMode"]): readonly string[] {
   switch (writeMode) {
     case "read_only": return PI_READ_ONLY_TOOLS;
     case "full_access": return PI_FULL_ACCESS_TOOLS;
     case "allowed":
     case undefined:
-      // Pi's bash tool is not workspace-sandboxed, so reserve it for full access.
       return PI_WORKSPACE_TOOLS;
   }
 }
