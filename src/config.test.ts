@@ -26,6 +26,7 @@ assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
+assert.equal(loadConfig(baseEnv).liveSessionsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
@@ -39,6 +40,7 @@ assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents,
   true,
 );
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LIVE_SESSIONS: "1" }).liveSessionsEnabled, true);
 assert.equal(resolveSubagentsFlag({}, {}), undefined);
 assert.equal(resolveSubagentsFlag({ subagents: true }, {}), true);
 assert.equal(resolveSubagentsFlag({ subagents: true }, { DEVSPACE_SUBAGENTS: "0" }), false);
@@ -174,6 +176,7 @@ writeFileSync(
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
     subagents: true,
+    liveSessions: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
   }),
@@ -190,6 +193,7 @@ assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
+assert.equal(fileConfig.liveSessionsEnabled, true);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
 assert.deepEqual(fileConfig.allowedHosts, [

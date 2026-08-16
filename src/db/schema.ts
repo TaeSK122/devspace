@@ -114,6 +114,34 @@ export const localAgentSessions = sqliteTable(
   ],
 );
 
+export const liveSessions = sqliteTable(
+  "live_sessions",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull(),
+    workspaceRoot: text("workspace_root").notNull(),
+    name: text("name").notNull(),
+    program: text("program").notNull(),
+    argsJson: text("args_json").notNull(),
+    paneId: text("pane_id"),
+    windowName: text("window_name").notNull(),
+    status: text("status").notNull(),
+    exitCode: integer("exit_code"),
+    error: text("error"),
+    interruptedAt: text("interrupted_at"),
+    interruptedActor: text("interrupted_actor"),
+    reconciledAt: text("reconciled_at"),
+    unavailableAt: text("unavailable_at"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("live_sessions_workspace_id_idx").on(table.workspaceId, table.updatedAt),
+    index("live_sessions_workspace_root_idx").on(table.workspaceRoot, table.updatedAt),
+    index("live_sessions_status_idx").on(table.status, table.updatedAt),
+  ],
+);
+
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
@@ -122,3 +150,5 @@ export type WorkspaceConversationBindingRow = typeof workspaceConversationBindin
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
+export type LiveSessionRow = typeof liveSessions.$inferSelect;
+export type NewLiveSessionRow = typeof liveSessions.$inferInsert;

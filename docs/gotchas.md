@@ -148,6 +148,30 @@ later tools. Other MCP hosts use this explicit workspace workflow as well.
 To review work, call `show_changes` once after the final related file change. It
 shows the combined changes and advances the review point automatically.
 
+## Live Monitor `Ctrl-C` Stops the Worker
+
+When Live Sessions are enabled, `devspace live watch` reserves `Ctrl-C` as the Emergency Brake for the currently selected worker. It is not the normal way to exit the viewer.
+
+If you only want to stop watching, click the black `[ Close Monitor ]` control with green text on the right side of the monitor status bar. That shuts down the outer monitor and its inner read-only viewer clients only; the separate tmux-backed worker server and worker processes continue running. Once the command returns to the shell, close the Terminal tab or window normally. Running tabs are green with white text, the currently selected tab is additionally bold, and any non-running session is red so stale or stopped work is visible without relying on scrolling pane output.
+
+If a live session was Braked or became unavailable, check:
+
+```bash
+npx @waishnav/devspace live list
+```
+
+The unresolved state intentionally blocks conflicting live execution until the user and Controller have reconciled it. After that decision, acknowledge it with:
+
+```bash
+npx @waishnav/devspace live resolve <id>
+```
+
+Resolving never resumes or restarts the old process.
+
+Brake records and escalates against the managed pane's process tree as it exists when the Brake begins. Descendants that were still owned by that tree are included even if the pane parent exits first. A process that had already daemonized, reparented away, and detached from the controlling terminal before Brake is not safely attributable to that terminal session, so DevSpace does not guess and kill unrelated system processes.
+
+Live Sessions currently require `tmux` in a POSIX environment. If the feature is enabled but `tmux` is missing, install/configure tmux before starting native live work or disable Live Sessions again.
+
 ## Data Retention
 
 DevSpace does not currently prune workspace sessions, conversation bindings,

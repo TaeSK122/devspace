@@ -10,11 +10,33 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { createLiveSessionManager } from "./live-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
+
+test("live session tools are opt-in and independent of tool mode", async (t) => {
+  const disabled = await fixture(t);
+  const disabledTools = (await disabled.client.listTools()).tools.map((tool) => tool.name);
+  assert.equal(disabledTools.some((name) => name.startsWith("live_")), false);
+
+  const enabled = await fixture(t, { live: true, toolMode: "minimal" });
+  const enabledTools = (await enabled.client.listTools()).tools.map((tool) => tool.name);
+  assert.deepEqual(
+    enabledTools.filter((name) => name.startsWith("live_")).sort(),
+    [
+      "live_brake_session",
+      "live_list_sessions",
+      "live_read_session",
+      "live_resolve_session",
+      "live_send_input",
+      "live_start_session",
+    ],
+  );
+  assert.equal(enabled.config.toolMode, "minimal");
+});
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const context = await fixture(t);
@@ -138,6 +160,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
     new WorkspaceRegistry(context.config, restoredStore),
     createReviewCheckpointManager(),
     new ProcessSessionManager(),
+    undefined,
     [],
     [],
   );
@@ -175,7 +198,10 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: { git?: boolean; live?: boolean; toolMode?: "minimal" | "full" } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -209,17 +235,20 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
+    ...(options.live ? { DEVSPACE_LIVE_SESSIONS: "1" } : {}),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
+  const liveSessions = options.live ? createLiveSessionManager(config) : undefined;
   const server = createMcpServer(
     config,
     workspaces,
     createReviewCheckpointManager(),
     new ProcessSessionManager(),
+    liveSessions,
     [],
     [],
   );
@@ -236,6 +265,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     closed = true;
     await client.close();
     await server.close();
+    liveSessions?.close();
     store.close();
   };
 

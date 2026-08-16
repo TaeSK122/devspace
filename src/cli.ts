@@ -27,6 +27,8 @@ import {
   resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
+import { createLiveSessionManager } from "./live-sessions.js";
+import type { LiveSessionRecord } from "./live-session-store.js";
 import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
   ensureDevspaceDefaultSkills,
@@ -40,7 +42,7 @@ import {
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "agents" | "live" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -67,6 +69,9 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       await runAgentsCommand(args);
       return;
+    case "live":
+      await runLiveCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -78,7 +83,13 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (
+    command === "init"
+    || command === "doctor"
+    || command === "config"
+    || command === "agents"
+    || command === "live"
+  ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -162,6 +173,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       allowedRoots,
       publicBaseUrl,
       subagents: resolveSubagentsFlag(files.config),
+      liveSessions: files.config.liveSessions === true,
     };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
@@ -224,6 +236,7 @@ async function serve(): Promise<void> {
     }
     console.log("auth: Owner password approval required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`live sessions: ${config.liveSessionsEnabled ? "enabled" : "disabled"}`);
     if (config.subagents) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }
@@ -257,6 +270,10 @@ async function runDoctor(): Promise<void> {
   console.log(`Git: ${checkGitAvailable()}`);
   console.log(`Bash shell: ${checkBashShell()}`);
   console.log(`SQLite native dependency: ${checkSqliteNative()}`);
+  const liveSessionsEnabled = process.env.DEVSPACE_LIVE_SESSIONS === undefined
+    ? files.config.liveSessions === true
+    : ["1", "true", "yes", "on"].includes(process.env.DEVSPACE_LIVE_SESSIONS.toLowerCase());
+  console.log(`Live sessions: ${liveSessionsEnabled ? "enabled" : "disabled"}`);
 
   try {
     const config = loadConfig();
@@ -281,20 +298,33 @@ function runConfigCommand(args: string[]): void {
   if (subcommand !== "set") {
     throw new Error(`Unknown config command: ${subcommand}`);
   }
-  if (key !== "publicBaseUrl") {
-    throw new Error("Only `devspace config set publicBaseUrl <url|null>` is supported right now.");
-  }
-
   const value = rest.join(" ").trim();
-  if (!value) {
-    throw new Error("Missing publicBaseUrl value.");
+  if (!value) throw new Error(`Missing ${key ?? "config"} value.`);
+
+  if (key === "publicBaseUrl") {
+    writeDevspaceConfig({
+      ...files.config,
+      publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
+    });
+    console.log(`Updated ${files.configPath}`);
+    return;
   }
 
-  writeDevspaceConfig({
-    ...files.config,
-    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
-  console.log(`Updated ${files.configPath}`);
+  if (key === "liveSessions") {
+    if (!["true", "false"].includes(value.toLowerCase())) {
+      throw new Error("liveSessions must be true or false.");
+    }
+    writeDevspaceConfig({
+      ...files.config,
+      liveSessions: value.toLowerCase() === "true",
+    });
+    console.log(`Updated ${files.configPath}`);
+    return;
+  }
+
+  throw new Error(
+    "Supported config keys: publicBaseUrl, liveSessions.",
+  );
 }
 
 function printHelp(): void {
@@ -309,13 +339,96 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace config set liveSessions <true|false>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",
+      "  devspace live list       List persistent native CLI sessions",
+      "  devspace live watch      Open the read-only live monitor",
+      "  devspace live brake <id> Emergency-stop one live session",
+      "  devspace live resolve <id> Acknowledge an interrupted/unavailable session",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
+    ].join("\n"),
+  );
+}
+
+async function runLiveCommand(args: string[]): Promise<void> {
+  const [subcommand, ...rest] = args;
+  const manager = createLiveSessionManager(loadConfig());
+  try {
+    switch (subcommand) {
+      case "ls":
+      case "list": {
+        const sessions = manager.list();
+        if (sessions.length === 0) {
+          console.log("No live sessions found.");
+          return;
+        }
+        for (const session of sessions) console.log(formatLiveSessionLine(session));
+        return;
+      }
+      case "watch":
+        await manager.watch();
+        return;
+      case "brake": {
+        const id = rest.find((entry) => !entry.startsWith("--"));
+        if (!id) throw new Error("Usage: devspace live brake <id> [--user]");
+        const actor = rest.includes("--user") ? "user" : "controller";
+        const session = await manager.brake(id, actor);
+        console.log(formatLiveSessionLine(session));
+        return;
+      }
+      case "resolve": {
+        const id = rest[0];
+        if (!id) throw new Error("Usage: devspace live resolve <id>");
+        const session = manager.resolve(id);
+        console.log(formatLiveSessionLine(session));
+        return;
+      }
+      case undefined:
+      case "help":
+      case "--help":
+      case "-h":
+        printLiveHelp();
+        return;
+      default:
+        throw new Error(`Unknown live command: ${subcommand}`);
+    }
+  } finally {
+    manager.close();
+  }
+}
+
+function formatLiveSessionLine(session: Pick<
+  LiveSessionRecord,
+  "id" | "status" | "name" | "workspaceRoot" | "reconciledAt"
+>): string {
+  const unresolved =
+    (session.status === "interrupted_by_user"
+      || session.status === "interrupted_by_controller"
+      || session.status === "unavailable")
+    && !session.reconciledAt
+      ? " unresolved"
+      : "";
+  return `${session.id} ${session.status}${unresolved} ${session.name} ${session.workspaceRoot}`;
+}
+
+function printLiveHelp(): void {
+  console.log(
+    [
+      "DevSpace live",
+      "",
+      "Usage:",
+      "  devspace live list",
+      "  devspace live watch",
+      "  devspace live brake <id>",
+      "  devspace live resolve <id>",
+      "",
+      "The watch view accepts ordinary mouse tab selection and reserves Ctrl-C as the Emergency Brake.",
+      "Click [ Close Monitor ] to leave the viewer without stopping managed workers, then close the Terminal normally.",
     ].join("\n"),
   );
 }

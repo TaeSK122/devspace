@@ -49,6 +49,11 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import {
+  createLiveSessionManager,
+  type LiveSessionManager,
+} from "./live-sessions.js";
+import type { LiveSessionRecord } from "./live-session-store.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -198,9 +203,12 @@ function serverInstructions(config: ServerConfig): string {
     config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
+  const liveInstruction = config.liveSessionsEnabled
+    ? " For persistent native CLI work, use live_list_sessions before starting potentially conflicting work. Before every live_send_input call, call live_read_session, inspect the rendered state yourself, and pass its fingerprint unchanged; if the interaction precondition fails, read again rather than retrying blindly. A session marked interrupted_by_user or interrupted_by_controller must never be resumed or replaced automatically; reconcile it explicitly with live_resolve_session only after the user and Controller have addressed it. DevSpace transports bytes and lifecycle state only; do not treat it as a semantic Agent layer."
+    : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${liveInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -213,7 +221,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, explicitly requested git add and git commit operations, package scripts, and commands that are better executed by the shell. Do not edit project file contents with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project file contents. Explicitly requested git add and git commit operations may update the Git index and local repository metadata.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, explicitly requested git add and git commit operations, package scripts, and commands that are better executed by the shell. Do not edit project file contents with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project file contents. Explicitly requested git add and git commit operations may update the Git index and local repository metadata.${artifactInstruction}${showChangesInstruction}${liveInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -697,11 +705,304 @@ function registerCodexProcessTools(
   );
 }
 
+function liveSessionOutput(session: LiveSessionRecord) {
+  return {
+    id: session.id,
+    workspaceId: session.workspaceId,
+    workspaceRoot: session.workspaceRoot,
+    name: session.name,
+    program: session.program,
+    args: session.args,
+    status: session.status,
+    paneId: session.paneId,
+    exitCode: session.exitCode,
+    error: session.error,
+    interruptedAt: session.interruptedAt,
+    interruptedActor: session.interruptedActor,
+    reconciledAt: session.reconciledAt,
+    unavailableAt: session.unavailableAt,
+    createdAt: session.createdAt,
+    updatedAt: session.updatedAt,
+  };
+}
+
+const liveSessionOutputObject = z.object({
+  id: z.string(),
+  workspaceId: z.string(),
+  workspaceRoot: z.string(),
+  name: z.string(),
+  program: z.string(),
+  args: z.array(z.string()),
+  status: z.enum([
+    "running",
+    "completed",
+    "failed",
+    "interrupted_by_user",
+    "interrupted_by_controller",
+    "unavailable",
+  ]),
+  paneId: z.string().optional(),
+  exitCode: z.number().optional(),
+  error: z.string().optional(),
+  interruptedAt: z.string().optional(),
+  interruptedActor: z.string().optional(),
+  reconciledAt: z.string().optional(),
+  unavailableAt: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+function resolveScopedLiveSessionId(
+  liveSessions: LiveSessionManager,
+  workspaceRoot: string,
+  idOrPrefix: string,
+): string {
+  const sessions = liveSessions.list({ workspaceRoot });
+  const exact = sessions.find((session) => session.id === idOrPrefix);
+  if (exact) return exact.id;
+  const matches = sessions.filter((session) => session.id.startsWith(idOrPrefix));
+  if (matches.length !== 1) {
+    throw new Error(`Unknown or ambiguous live session in workspace root ${workspaceRoot}: ${idOrPrefix}`);
+  }
+  return matches[0]!.id;
+}
+
+function registerLiveSessionTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  liveSessions: LiveSessionManager,
+): void {
+  registerAppTool(
+    server,
+    "live_list_sessions",
+    {
+      title: "List live sessions",
+      description:
+        "List persistent native CLI sessions for one workspace, including unresolved interrupted or unavailable state. Use this before starting potentially conflicting work.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+      },
+      outputSchema: resultOutputSchema({
+        sessions: z.array(liveSessionOutputObject),
+      }),
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const sessions = liveSessions.list({ workspaceRoot: workspace.root });
+      const result = sessions.length === 0
+        ? "No live sessions exist in this workspace."
+        : sessions.map((session) => `${session.id} ${session.status} ${session.name}`).join("\n");
+      return {
+        content: [textBlock(result)],
+        structuredContent: {
+          result,
+          sessions: sessions.map(liveSessionOutput),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "live_start_session",
+    {
+      title: "Start native CLI session",
+      description:
+        "Start a real local program directly in a persistent tmux PTY without a provider or Agent abstraction. The program and argv are passed mechanically with no shell interpolation.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        name: z.string().min(1).max(80).optional().describe("Human-readable monitor tab label."),
+        program: z.string().min(1).describe("Executable name or path to run directly."),
+        args: z.array(z.string()).max(100).optional().describe("Exact argv values passed to the program."),
+        workingDirectory: z
+          .string()
+          .optional()
+          .describe("Working directory relative to the workspace root. Defaults to the workspace root."),
+        allowConcurrent: z
+          .boolean()
+          .optional()
+          .describe("Set true only after intentionally deciding this session may run beside existing live sessions in the same workspace."),
+      },
+      outputSchema: resultOutputSchema({
+        session: liveSessionOutputObject,
+      }),
+      _meta: {},
+      annotations: SHELL_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, name, program, args, workingDirectory, allowConcurrent }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+      const session = liveSessions.start({
+        workspaceId,
+        workspaceRoot: workspace.root,
+        cwd,
+        name,
+        program,
+        args,
+        allowConcurrent,
+      });
+      const result = `Started live session ${session.id} (${session.name}) in ${session.workspaceRoot}.`;
+      return {
+        content: [textBlock(result)],
+        structuredContent: { result, session: liveSessionOutput(session) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "live_read_session",
+    {
+      title: "Read live session",
+      description:
+        "Read a bounded rendered view from a native CLI session. Returns a screen fingerprint that must be passed unchanged to live_send_input so input fails closed if the screen changes first.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        sessionId: z.string().min(1).describe("Live session id or unique id prefix."),
+        lines: z.number().int().min(1).max(500).optional().describe("Maximum rendered lines. Defaults to 40."),
+        maxCharacters: z
+          .number()
+          .int()
+          .min(256)
+          .max(100_000)
+          .optional()
+          .describe("Maximum returned characters. Defaults to 12000."),
+      },
+      outputSchema: resultOutputSchema({
+        session: liveSessionOutputObject,
+        output: z.string(),
+        fingerprint: z.string(),
+      }),
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, sessionId, lines, maxCharacters }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const resolvedId = resolveScopedLiveSessionId(liveSessions, workspace.root, sessionId);
+      const snapshot = liveSessions.read(resolvedId, { lines, maxCharacters });
+      const result = snapshot.output || `${snapshot.session.id} is ${snapshot.session.status}; no pane output is available.`;
+      return {
+        content: [textBlock(result)],
+        structuredContent: {
+          result,
+          session: liveSessionOutput(snapshot.session),
+          output: snapshot.output,
+          fingerprint: snapshot.fingerprint,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "live_send_input",
+    {
+      title: "Send input to native CLI",
+      description:
+        "Paste exact text into a running native CLI and optionally submit it. Requires the fingerprint from a prior live_read_session; if the screen changed, the send fails instead of guessing or retrying.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        sessionId: z.string().min(1).describe("Live session id or unique id prefix."),
+        text: z.string().max(2_000_000).describe("Exact UTF-8 text to paste without semantic rewriting. Literal terminal control characters are transported literally and may be acted on by the TTY; use live_brake_session for managed interrupts."),
+        expectedFingerprint: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .describe("Fingerprint returned by the immediately preceding live_read_session call."),
+        submit: z.boolean().optional().describe("Defaults to true. When true, submits with a literal carriage return after the paste."),
+      },
+      outputSchema: resultOutputSchema({
+        session: liveSessionOutputObject,
+      }),
+      _meta: {},
+      annotations: SHELL_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, sessionId, text, expectedFingerprint, submit }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const resolvedId = resolveScopedLiveSessionId(liveSessions, workspace.root, sessionId);
+      const session = liveSessions.send({
+        sessionId: resolvedId,
+        text,
+        expectedFingerprint,
+        submit,
+      });
+      const result = `Sent ${Array.from(text).length} characters to ${session.id}${submit === false ? " without submitting" : " and submitted"}.`;
+      return {
+        content: [textBlock(result)],
+        structuredContent: { result, session: liveSessionOutput(session) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "live_brake_session",
+    {
+      title: "Brake native CLI session",
+      description:
+        "Emergency-stop exactly one managed native CLI session from the Controller. The interrupted_by_controller state is persisted before signalling, then DevSpace escalates mechanically if the process ignores the initial interrupt. It never auto-resumes the session.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        sessionId: z.string().min(1).describe("Live session id or unique id prefix."),
+      },
+      outputSchema: resultOutputSchema({
+        session: liveSessionOutputObject,
+      }),
+      _meta: {},
+      annotations: SHELL_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, sessionId }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const resolvedId = resolveScopedLiveSessionId(liveSessions, workspace.root, sessionId);
+      const session = await liveSessions.brake(resolvedId, "controller");
+      const result = `Braked live session ${session.id}; state is ${session.status}.`;
+      return {
+        content: [textBlock(result)],
+        structuredContent: { result, session: liveSessionOutput(session) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "live_resolve_session",
+    {
+      title: "Resolve stopped live session",
+      description:
+        "Acknowledge an interrupted_by_user, interrupted_by_controller, or unavailable live session after the user and Controller have reconciled it. This never resumes or restarts the old process.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        sessionId: z.string().min(1).describe("Live session id or unique id prefix."),
+      },
+      outputSchema: resultOutputSchema({
+        session: liveSessionOutputObject,
+      }),
+      _meta: {},
+      annotations: EDIT_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, sessionId }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const resolvedId = resolveScopedLiveSessionId(liveSessions, workspace.root, sessionId);
+      const session = liveSessions.resolve(resolvedId);
+      const result = `Resolved live session ${session.id}; old state remains ${session.status} and will not resume.`;
+      return {
+        content: [textBlock(result)],
+        structuredContent: { result, session: liveSessionOutput(session) },
+      };
+    },
+  );
+
+  logEvent(config.logging, "info", "live_session_tools_registered", {});
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
+  liveSessions: LiveSessionManager | undefined,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
 ): McpServer {
@@ -1650,6 +1951,10 @@ export function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  if (liveSessions) {
+    registerLiveSessionTools(server, config, workspaces, liveSessions);
+  }
+
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(server, {
       config,
@@ -1691,6 +1996,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const liveSessions = config.liveSessionsEnabled ? createLiveSessionManager(config) : undefined;
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
@@ -1853,6 +2159,7 @@ export function createServer(
           workspaces,
           reviewCheckpoints,
           processSessions,
+          liveSessions,
           localAgentProviders,
           incomingArtifactAdapters,
         );
@@ -1885,6 +2192,7 @@ export function createServer(
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        liveSessions?.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

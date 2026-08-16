@@ -24,6 +24,7 @@ npx @waishnav/devspace serve
 npx @waishnav/devspace doctor
 npx @waishnav/devspace config get
 npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
+npx @waishnav/devspace config set liveSessions true
 ```
 
 ## Core Environment Variables
@@ -38,6 +39,63 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
+| `DEVSPACE_LIVE_SESSIONS` | Set to `1` to expose persistent native CLI session tools. Disabled by default. |
+
+## Persistent Native CLI Sessions
+
+Live Sessions are an opt-in local execution feature for letting an MCP host drive a real native terminal program while the user watches it safely. The host remains the semantic Controller; DevSpace only transports exact input bytes, exposes bounded rendered state, and persists mechanical lifecycle state.
+
+Enable the feature with either:
+
+```bash
+npx @waishnav/devspace config set liveSessions true
+```
+
+or for one server run:
+
+```bash
+DEVSPACE_LIVE_SESSIONS=1 npx @waishnav/devspace serve
+```
+
+This path currently requires a POSIX environment with `tmux` available on `PATH`. It has been exercised on macOS. Windows support is not claimed for this feature.
+
+When enabled, the MCP surface adds:
+
+- `live_list_sessions`
+- `live_start_session`
+- `live_read_session`
+- `live_send_input`
+- `live_brake_session`
+- `live_resolve_session`
+
+These tools are independent of `DEVSPACE_TOOL_MODE`; they can be exposed alongside the default `minimal` surface.
+
+`live_start_session` launches the requested executable directly with argv values rather than interpolating a shell command. DevSpace keeps the real program inside a persistent tmux PTY. Session state is stored in DevSpace's SQLite state so interrupted or unavailable work remains visible across DevSpace restarts.
+
+Before sending input, the host must call `live_read_session`, inspect the rendered state, and pass its returned screen fingerprint unchanged to `live_send_input`. DevSpace rechecks that fingerprint immediately before pasting input. If the screen changed — for example because a trust, update, or approval prompt appeared — the send fails and the host must read again rather than retry blindly.
+
+`live_send_input.text` is transported literally. Embedded terminal control characters are therefore not rewritten or blocked and may be interpreted by the native TTY; use `live_brake_session` or the monitor Emergency Brake for managed interrupts so interrupted lifecycle state is persisted first.
+
+The user can watch active sessions with:
+
+```bash
+npx @waishnav/devspace live watch
+```
+
+The monitor provides mouse-selectable tabs in a fixed status bar that remains visible while worker output scrolls. Running sessions use a green background with white text; the currently selected tab is additionally bold. Any non-running mechanical state (`completed`, `failed`, `interrupted_by_user`, `interrupted_by_controller`, or `unavailable`) uses a red background with white text. Each inner worker view is attached read-only, so ordinary accidental typing does not reach the worker. `Ctrl-C` in this monitor is reserved as the user Emergency Brake for the currently selected live session. User Brake records `interrupted_by_user`; a Controller-initiated `live_brake_session` records `interrupted_by_controller`. Both are persisted before signalling and neither state is automatically resumed.
+
+**To stop watching without stopping the worker, click the black `[ Close Monitor ]` control with green text on the right side of the tmux status bar. Do not press `Ctrl-C` just to leave the monitor.** The close control shuts down only the outer monitor and its inner read-only viewer clients; the separate worker tmux server and managed workers continue running. After the command returns to the shell, the Terminal tab or window can be closed normally without terminating the worker.
+
+Use:
+
+```bash
+npx @waishnav/devspace live list
+npx @waishnav/devspace live resolve <id>
+```
+
+`live resolve` only records that the user and Controller have reconciled an `interrupted_by_user`, `interrupted_by_controller`, or `unavailable` session. It does not restart, resume, or delete the old process/session state.
+
+Brake snapshots the managed pane process tree before the first interrupt and tracks process-group identities across escalation, so descendants that were still owned by that tree at Brake time are stopped even if the pane parent exits first. A process that had already fully daemonized, reparented away from the managed tree, and detached from the controlling terminal before Brake is outside the terminal's safely provable ownership boundary; DevSpace does not guess at unrelated system processes.
 
 ## Native Artifact Download
 

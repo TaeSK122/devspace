@@ -29,6 +29,7 @@ export interface ServerConfig {
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: boolean;
+  liveSessionsEnabled: boolean;
   agentDir: string;
   logging: LoggingConfig;
 }
@@ -251,6 +252,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.DEVSPACE_SUBAGENTS === undefined
         ? files.config.subagents === true
         : parseBoolean(env.DEVSPACE_SUBAGENTS),
+    liveSessionsEnabled:
+      env.DEVSPACE_LIVE_SESSIONS === undefined
+        ? files.config.liveSessions === true
+        : parseBoolean(env.DEVSPACE_LIVE_SESSIONS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
   };

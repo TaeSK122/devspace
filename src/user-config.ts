@@ -21,6 +21,7 @@ export interface DevspaceUserConfig {
   artifactMaxFileBytes?: number;
   agentDir?: string;
   subagents?: boolean;
+  liveSessions?: boolean;
 }
 
 export interface DevspaceAuthConfig {

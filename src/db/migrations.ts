@@ -27,6 +27,11 @@ const migrations: Migration[] = [
     name: "workspace-conversation-bindings",
     up: migrateWorkspaceConversationBindings,
   },
+  {
+    version: 5,
+    name: "live-sessions",
+    up: migrateLiveSessions,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -195,6 +200,39 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
 
     create index if not exists workspace_conversation_bindings_workspace_idx
       on workspace_conversation_bindings(workspace_session_id);
+  `);
+}
+
+function migrateLiveSessions(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists live_sessions (
+      id text primary key,
+      workspace_id text not null,
+      workspace_root text not null,
+      name text not null,
+      program text not null,
+      args_json text not null,
+      pane_id text,
+      window_name text not null,
+      status text not null,
+      exit_code integer,
+      error text,
+      interrupted_at text,
+      interrupted_actor text,
+      reconciled_at text,
+      unavailable_at text,
+      created_at text not null,
+      updated_at text not null
+    );
+
+    create index if not exists live_sessions_workspace_id_idx
+      on live_sessions(workspace_id, updated_at desc);
+
+    create index if not exists live_sessions_workspace_root_idx
+      on live_sessions(workspace_root, updated_at desc);
+
+    create index if not exists live_sessions_status_idx
+      on live_sessions(status, updated_at desc);
   `);
 }
 
